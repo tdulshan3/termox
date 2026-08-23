@@ -200,8 +200,24 @@ servers are equally open.
 
 ## Screenshots
 
-Drop images into `docs/` and reference them here — the dashboard renders a host
-page, a page per virtual machine, and a page per model server.
+The sidebar groups everything into **Host**, **Machines** and **Services**, and
+each gets its own page. Any page can be linked to directly with `?view=<key>`.
+
+**The phone.** Per-core load derived from idle residency, clustered by silicon
+tier, with the panels that cannot be read saying why.
+
+![The host page](docs/img/host.png)
+
+**A machine.** Discovered from its command line, with its forwarded ports
+probed, its disk measured from the qcow2 header, and the guest read over SSH
+with nothing installed inside it — down to the containers.
+
+![A virtual machine](docs/img/machine.png)
+
+**A model server.** Throughput and processor trends, the runtime it actually
+got, and the endpoints to point a client at.
+
+![A model server](docs/img/service.png)
 
 ## Status
 

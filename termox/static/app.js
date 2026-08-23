@@ -9,9 +9,14 @@
 const POLL_MS = 2000;
 const TOKEN = new URLSearchParams(location.search).get('token');
 
+// A ?view= parameter wins over the remembered selection, so a page can be
+// linked to directly -- useful for sharing "look at this machine" and for
+// screenshotting a specific page.
 const state = {
   data: null,
-  selected: sessionStorage.getItem('termox.selected') || 'host',
+  selected: new URLSearchParams(location.search).get('view')
+    || sessionStorage.getItem('termox.selected')
+    || 'host',
   failures: 0,
 };
 
@@ -915,6 +920,10 @@ function renderRail(data) {
 function select(key) {
   state.selected = key;
   sessionStorage.setItem('termox.selected', key);
+  const url = new URL(location.href);
+  if (key === 'host') url.searchParams.delete('view');
+  else url.searchParams.set('view', key);
+  history.replaceState(null, '', url);
   render();
   $('stage').focus();
 }
