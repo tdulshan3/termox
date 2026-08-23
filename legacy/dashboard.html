@@ -1,0 +1,597 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>StackScope</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@400;500;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+<style>
+:root{
+  --void:#080B12; --panel:#0F1420; --panel2:#151B2A; --panel3:#1B2233;
+  --edge:#232B3D; --edge-soft:#1A2130;
+  --host:#7C93FF; --guest:#3DDCC4; --pod:#F0A93B;
+  --ink:#DCE3F0; --ink-dim:#6E7A94; --ink-faint:#48536A;
+  --alarm:#FF6B7A; --warn:#F0A93B;
+  --display:"Space Grotesk",system-ui,sans-serif;
+  --mono:"JetBrains Mono",ui-monospace,Menlo,monospace;
+}
+*{box-sizing:border-box}
+html,body{margin:0;padding:0}
+body{
+  background:var(--void); color:var(--ink); font-family:var(--display);
+  font-size:15px; line-height:1.45; -webkit-font-smoothing:antialiased;
+  padding:22px 20px 60px;
+}
+.wrap{max-width:1180px;margin:0 auto}
+
+/* ---------- masthead ---------- */
+.masthead{display:flex;align-items:baseline;gap:18px;flex-wrap:wrap;margin-bottom:6px}
+.masthead h1{
+  font-size:26px;font-weight:700;letter-spacing:-.02em;margin:0;
+}
+.masthead h1 span{color:var(--ink-faint);font-weight:400}
+.pulse{
+  display:inline-flex;align-items:center;gap:7px;font-family:var(--mono);
+  font-size:11px;letter-spacing:.09em;text-transform:uppercase;color:var(--ink-dim);
+}
+.pulse i{
+  width:7px;height:7px;border-radius:50%;background:var(--guest);
+  box-shadow:0 0 0 0 rgba(61,220,196,.6);animation:beat 2s infinite;
+}
+.pulse.is-stale i{background:var(--alarm);animation:none}
+@keyframes beat{
+  0%{box-shadow:0 0 0 0 rgba(61,220,196,.55)}
+  70%{box-shadow:0 0 0 7px rgba(61,220,196,0)}
+  100%{box-shadow:0 0 0 0 rgba(61,220,196,0)}
+}
+.subtitle{
+  color:var(--ink-faint);font-family:var(--mono);font-size:12px;
+  margin:0 0 26px;letter-spacing:.02em;
+}
+
+/* ---------- strata ---------- */
+.stratum{
+  border:1px solid var(--edge); border-left-width:3px;
+  border-radius:10px; padding:18px 20px 20px; margin-top:16px;
+  background:var(--panel);
+}
+.stratum--host{border-left-color:var(--host);background:var(--panel)}
+.stratum--guest{border-left-color:var(--guest);background:var(--panel2);margin-top:22px}
+.stratum--pod{border-left-color:var(--pod);background:var(--panel3);margin-top:22px}
+
+.stratum-head{
+  display:flex;align-items:center;gap:12px;flex-wrap:wrap;
+  margin-bottom:16px;
+}
+.stratum-tag{
+  font-family:var(--mono);font-size:10px;letter-spacing:.16em;
+  text-transform:uppercase;padding:3px 8px;border-radius:4px;
+  border:1px solid currentColor;
+}
+.stratum--host .stratum-tag{color:var(--host)}
+.stratum--guest .stratum-tag{color:var(--guest)}
+.stratum--pod .stratum-tag{color:var(--pod)}
+.stratum-name{font-size:17px;font-weight:500;letter-spacing:-.01em}
+.stratum-meta{
+  margin-left:auto;font-family:var(--mono);font-size:11.5px;color:var(--ink-dim);
+  display:flex;gap:16px;flex-wrap:wrap;
+}
+
+/* ---------- grid + metrics ---------- */
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(230px,1fr));gap:14px}
+.metric{border:1px solid var(--edge-soft);border-radius:8px;padding:13px 14px}
+.metric-label{
+  font-family:var(--mono);font-size:10px;letter-spacing:.13em;
+  text-transform:uppercase;color:var(--ink-faint);margin-bottom:9px;
+}
+.metric-value{font-family:var(--mono);font-size:23px;font-weight:500;letter-spacing:-.02em}
+.metric-value small{font-size:12px;color:var(--ink-dim);font-weight:400;margin-left:3px}
+.metric-note{font-family:var(--mono);font-size:11px;color:var(--ink-dim);margin-top:6px}
+
+.bar{height:5px;border-radius:3px;background:var(--edge);overflow:hidden;margin-top:10px}
+.bar i{display:block;height:100%;border-radius:3px;width:0;transition:width .55s cubic-bezier(.22,1,.36,1)}
+.stratum--host .bar i{background:var(--host)}
+.stratum--guest .bar i{background:var(--guest)}
+.stratum--pod .bar i{background:var(--pod)}
+.bar.is-hot i{background:var(--warn)}
+.bar.is-critical i{background:var(--alarm)}
+
+/* ---------- core meters ---------- */
+.clusters{display:flex;gap:26px;flex-wrap:wrap;align-items:flex-end}
+.cluster-label{
+  font-family:var(--mono);font-size:10px;letter-spacing:.11em;
+  text-transform:uppercase;color:var(--ink-faint);margin-bottom:10px;
+}
+.cluster-label b{color:var(--ink-dim);font-weight:500}
+.cores{display:flex;gap:7px;align-items:flex-end}
+.core{width:30px;text-align:center}
+.core-track{
+  height:72px;border-radius:4px;background:var(--edge);
+  display:flex;align-items:flex-end;overflow:hidden;
+}
+.core-fill{
+  width:100%;background:var(--host);border-radius:4px;height:0;
+  transition:height .55s cubic-bezier(.22,1,.36,1);
+}
+.core-fill.is-hot{background:var(--warn)}
+.core-fill.is-critical{background:var(--alarm)}
+.core-id{font-family:var(--mono);font-size:9.5px;color:var(--ink-faint);margin-top:6px}
+.core-pct{font-family:var(--mono);font-size:10px;color:var(--ink-dim);margin-top:2px}
+
+/* ---------- chips ---------- */
+.chips{display:flex;gap:8px;flex-wrap:wrap;margin-top:4px}
+.chip{
+  font-family:var(--mono);font-size:11px;padding:5px 9px;border-radius:5px;
+  border:1px solid var(--edge-soft);color:var(--ink-dim);
+}
+.chip b{color:var(--ink);font-weight:500}
+.chip.is-hot{border-color:rgba(240,169,59,.4);color:var(--warn)}
+.chip.is-critical{border-color:rgba(255,107,122,.45);color:var(--alarm)}
+
+/* ---------- containers ---------- */
+.pods{display:flex;flex-direction:column;gap:9px}
+.pod{
+  display:grid;grid-template-columns:minmax(140px,1.5fr) 1fr 1fr minmax(90px,auto);
+  gap:14px;align-items:center;
+  border:1px solid var(--edge-soft);border-radius:8px;padding:12px 14px;
+}
+.pod-name{font-family:var(--mono);font-size:13px;font-weight:500}
+.pod-image{font-family:var(--mono);font-size:10.5px;color:var(--ink-faint);margin-top:3px;
+  overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.pod-figure{font-family:var(--mono);font-size:14px}
+.pod-caption{font-family:var(--mono);font-size:10px;letter-spacing:.11em;
+  text-transform:uppercase;color:var(--ink-faint);margin-bottom:4px}
+.pod-state{
+  font-family:var(--mono);font-size:10px;letter-spacing:.1em;text-transform:uppercase;
+  padding:3px 8px;border-radius:4px;border:1px solid var(--edge);
+  color:var(--ink-dim);justify-self:end;white-space:nowrap;
+}
+.pod-state.is-up{color:var(--pod);border-color:rgba(240,169,59,.4)}
+.pod-state.is-down{color:var(--alarm);border-color:rgba(255,107,122,.4)}
+
+/* ---------- messages ---------- */
+.notice{
+  font-family:var(--mono);font-size:12px;color:var(--ink-dim);
+  border:1px dashed var(--edge);border-radius:8px;padding:14px;
+}
+.notice.is-bad{color:var(--alarm);border-color:rgba(255,107,122,.35)}
+.banner{
+  font-family:var(--mono);font-size:12.5px;color:var(--alarm);
+  border:1px solid rgba(255,107,122,.35);border-radius:8px;
+  padding:11px 14px;margin-bottom:14px;
+}
+.banner[hidden]{display:none}
+
+:focus-visible{outline:2px solid var(--guest);outline-offset:3px}
+
+@media (max-width:720px){
+  body{padding:16px 12px 48px}
+  .stratum{padding:15px 14px 16px}
+  .stratum--guest,.stratum--pod{margin-left:0}
+  .pod{grid-template-columns:1fr 1fr;gap:10px}
+  .pod-state{justify-self:start}
+  .metric-value{font-size:20px}
+}
+@media (prefers-reduced-motion:reduce){
+  *{transition:none!important;animation:none!important}
+}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+  <div class="masthead">
+    <h1>StackScope<span>&nbsp;/ three layers deep</span></h1>
+    <span class="pulse" id="pulse"><i></i><span id="pulse-text">connecting</span></span>
+  </div>
+  <p class="subtitle" id="subtitle">Android host &rarr; emulated guest &rarr; containers</p>
+
+  <div class="banner" id="banner" hidden></div>
+
+  <!-- ============ LAYER 1: ANDROID HOST ============ -->
+  <section class="stratum stratum--host">
+    <div class="stratum-head">
+      <span class="stratum-tag">Layer 1 &middot; Host</span>
+      <span class="stratum-name" id="host-name">&mdash;</span>
+      <span class="stratum-meta">
+        <span id="host-uptime">uptime &mdash;</span>
+        <span id="host-load">load &mdash;</span>
+      </span>
+    </div>
+
+    <div class="metric" style="margin-bottom:14px">
+      <div class="metric-label">Processor &mdash; <span id="host-cpu-count">?</span> cores by cluster</div>
+      <div class="clusters" id="clusters"></div>
+    </div>
+
+    <div class="grid">
+      <div class="metric">
+        <div class="metric-label">CPU total</div>
+        <div class="metric-value" id="host-cpu-total">&mdash;<small>%</small></div>
+        <div class="bar"><i id="host-cpu-bar"></i></div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Memory</div>
+        <div class="metric-value" id="host-mem">&mdash;</div>
+        <div class="bar"><i id="host-mem-bar"></i></div>
+        <div class="metric-note" id="host-mem-note"></div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">GPU &mdash; Adreno 650</div>
+        <div class="metric-value" id="host-gpu">&mdash;</div>
+        <div class="bar"><i id="host-gpu-bar"></i></div>
+        <div class="metric-note" id="host-gpu-note"></div>
+      </div>
+      <div class="metric">
+        <div class="metric-label">Battery</div>
+        <div class="metric-value" id="host-batt">&mdash;</div>
+        <div class="bar"><i id="host-batt-bar"></i></div>
+        <div class="metric-note" id="host-batt-note"></div>
+      </div>
+    </div>
+
+    <div class="metric" style="margin-top:14px">
+      <div class="metric-label">Storage</div>
+      <div class="chips" id="host-storage"></div>
+    </div>
+
+    <div class="metric" style="margin-top:14px">
+      <div class="metric-label">Thermal zones</div>
+      <div class="chips" id="host-thermals"></div>
+    </div>
+
+    <!-- ============ LAYER 2: QEMU GUEST ============ -->
+    <section class="stratum stratum--guest">
+      <div class="stratum-head">
+        <span class="stratum-tag">Layer 2 &middot; Guest</span>
+        <span class="stratum-name" id="vm-name">&mdash;</span>
+        <span class="stratum-meta">
+          <span id="vm-uptime">uptime &mdash;</span>
+          <span id="vm-load">load &mdash;</span>
+          <span id="vm-latency">agent &mdash;</span>
+        </span>
+      </div>
+
+      <div id="vm-body">
+        <div class="grid">
+          <div class="metric">
+            <div class="metric-label">Virtual CPU</div>
+            <div class="metric-value" id="vm-cpu">&mdash;<small>%</small></div>
+            <div class="bar"><i id="vm-cpu-bar"></i></div>
+            <div class="metric-note" id="vm-cpu-note"></div>
+          </div>
+          <div class="metric">
+            <div class="metric-label">Memory</div>
+            <div class="metric-value" id="vm-mem">&mdash;</div>
+            <div class="bar"><i id="vm-mem-bar"></i></div>
+            <div class="metric-note" id="vm-mem-note"></div>
+          </div>
+          <div class="metric">
+            <div class="metric-label">Virtual cores</div>
+            <div class="clusters">
+              <div>
+                <div class="cluster-label">emulated <b id="vm-core-count">&mdash;</b></div>
+                <div class="cores" id="vm-cores"></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="metric" style="margin-top:14px">
+          <div class="metric-label">Filesystems</div>
+          <div class="chips" id="vm-disks"></div>
+        </div>
+
+        <!-- ============ LAYER 3: CONTAINERS ============ -->
+        <section class="stratum stratum--pod">
+          <div class="stratum-head">
+            <span class="stratum-tag">Layer 3 &middot; Containers</span>
+            <span class="stratum-name" id="pod-count">&mdash;</span>
+            <span class="stratum-meta"><span id="pod-age">sampled &mdash;</span></span>
+          </div>
+          <div class="pods" id="pods"></div>
+        </section>
+      </div>
+
+      <div class="notice is-bad" id="vm-offline" hidden></div>
+    </section>
+  </section>
+
+</div>
+
+<script>
+"use strict";
+
+const POLL_MS = 2000;
+const $ = id => document.getElementById(id);
+
+/* ---------- formatting ---------- */
+function bytes(n){
+  if(n === null || n === undefined) return "\u2014";
+  const u = ["B","KB","MB","GB","TB"];
+  let i = 0, v = n;
+  while(v >= 1024 && i < u.length - 1){ v /= 1024; i++; }
+  return (v >= 100 || i === 0 ? v.toFixed(0) : v.toFixed(1)) + " " + u[i];
+}
+function duration(sec){
+  if(sec === null || sec === undefined) return "\u2014";
+  const d = Math.floor(sec/86400), h = Math.floor(sec%86400/3600), m = Math.floor(sec%3600/60);
+  if(d) return d + "d " + h + "h";
+  if(h) return h + "h " + m + "m";
+  return m + "m";
+}
+function pct(v){ return (v === null || v === undefined) ? "\u2014" : v.toFixed(0); }
+function severity(v){
+  if(v === null || v === undefined) return "";
+  if(v >= 90) return "is-critical";
+  if(v >= 70) return "is-hot";
+  return "";
+}
+function setBar(el, value){
+  el.style.width = (value === null || value === undefined ? 0 : Math.min(100, value)) + "%";
+  const parent = el.parentElement;
+  parent.classList.remove("is-hot","is-critical");
+  const s = severity(value);
+  if(s) parent.classList.add(s);
+}
+
+/* ---------- host ---------- */
+function renderClusters(cpu){
+  const box = $("clusters");
+  const byId = new Map((cpu.cores||[]).map(c => [c.id, c]));
+  box.innerHTML = "";
+  (cpu.clusters||[]).forEach(cl => {
+    const group = document.createElement("div");
+    const label = document.createElement("div");
+    label.className = "cluster-label";
+    label.innerHTML = cl.label + " <b>" + cl.cores.length + "\u00d7" +
+      (cl.max_mhz ? " " + (cl.max_mhz/1000).toFixed(2) + " GHz" : "") + "</b>";
+    const row = document.createElement("div");
+    row.className = "cores";
+    cl.cores.forEach(id => {
+      const core = byId.get(id) || {id:id, percent:null, mhz:null};
+      const cell = document.createElement("div");
+      cell.className = "core";
+      const track = document.createElement("div");
+      track.className = "core-track";
+      const fill = document.createElement("div");
+      fill.className = "core-fill " + severity(core.percent);
+      fill.style.height = (core.percent || 0) + "%";
+      track.appendChild(fill);
+      const idEl = document.createElement("div");
+      idEl.className = "core-id";
+      idEl.textContent = core.mhz ? (core.mhz/1000).toFixed(1) + "G" : "cpu" + core.id;
+      const pctEl = document.createElement("div");
+      pctEl.className = "core-pct";
+      pctEl.textContent = pct(core.percent);
+      cell.append(track, idEl, pctEl);
+      row.appendChild(cell);
+    });
+    group.append(label, row);
+    box.appendChild(group);
+  });
+}
+
+function renderHost(h){
+  $("host-name").textContent = h.hostname || "android";
+  $("host-uptime").textContent = "uptime " + duration(h.uptime);
+  $("host-load").textContent = h.load ? "load " + h.load.map(x=>x.toFixed(2)).join(" ") : "load \u2014";
+  $("host-cpu-count").textContent = h.cpu.count;
+  $("host-cpu-total").innerHTML = pct(h.cpu.total) + "<small>%</small>";
+  setBar($("host-cpu-bar"), h.cpu.total);
+  renderClusters(h.cpu);
+
+  const m = h.memory;
+  if(m){
+    $("host-mem").innerHTML = bytes(m.used) + "<small> / " + bytes(m.total) + "</small>";
+    setBar($("host-mem-bar"), m.percent);
+    $("host-mem-note").textContent = bytes(m.available) + " available" +
+      (m.swap_total ? " \u00b7 swap " + bytes(m.swap_used) + "/" + bytes(m.swap_total) : "");
+  }
+
+  const g = h.gpu || {};
+  if(g.available && g.percent !== null && g.percent !== undefined){
+    $("host-gpu").innerHTML = pct(g.percent) + "<small>%</small>";
+    setBar($("host-gpu-bar"), g.percent);
+    $("host-gpu-note").textContent = g.clock_mhz ? g.clock_mhz + " MHz" +
+      (g.max_clock_mhz ? " of " + g.max_clock_mhz : "") : "";
+  } else {
+    $("host-gpu").textContent = "unreadable";
+    setBar($("host-gpu-bar"), 0);
+    $("host-gpu-note").textContent = g.reason || "kgsl counters need root";
+  }
+
+  const b = h.battery || {};
+  if(b.available){
+    $("host-batt").innerHTML = b.percentage + "<small>%</small>";
+    setBar($("host-batt-bar"), b.percentage);
+    $("host-batt-note").textContent = [b.status, b.plugged, b.celsius ? b.celsius + "\u00b0C" : null]
+      .filter(Boolean).join(" \u00b7 ").toLowerCase();
+  } else {
+    $("host-batt").textContent = "\u2014";
+    setBar($("host-batt-bar"), 0);
+    $("host-batt-note").textContent = b.reason || "termux-api unavailable";
+  }
+
+  $("host-storage").innerHTML = "";
+  (h.storage||[]).forEach(s => {
+    const chip = document.createElement("span");
+    chip.className = "chip " + severity(s.percent);
+    chip.innerHTML = s.label + " <b>" + bytes(s.used) + "</b> / " + bytes(s.total) +
+      " \u00b7 " + s.percent + "%";
+    $("host-storage").appendChild(chip);
+  });
+
+  const tz = $("host-thermals");
+  tz.innerHTML = "";
+  if(!(h.thermals||[]).length){
+    const chip = document.createElement("span");
+    chip.className = "chip";
+    chip.textContent = "no readable thermal zones";
+    tz.appendChild(chip);
+  }
+  (h.thermals||[]).forEach(t => {
+    const chip = document.createElement("span");
+    chip.className = "chip " + (t.celsius >= 55 ? "is-critical" : t.celsius >= 45 ? "is-hot" : "");
+    chip.innerHTML = t.zone + " <b>" + t.celsius + "\u00b0C</b>";
+    tz.appendChild(chip);
+  });
+}
+
+/* ---------- guest ---------- */
+function renderGuest(g){
+  const offline = $("vm-offline");
+  if(!g || !g.ok){
+    $("vm-body").hidden = true;
+    offline.hidden = false;
+    offline.textContent = (g && g.error) || "guest agent not responding";
+    $("vm-name").textContent = "offline";
+    return;
+  }
+  $("vm-body").hidden = false;
+  offline.hidden = true;
+
+  $("vm-name").textContent = g.hostname || "guest";
+  $("vm-uptime").textContent = "uptime " + duration(g.uptime);
+  $("vm-load").textContent = g.load ? "load " + g.load.map(x=>x.toFixed(2)).join(" ") : "load \u2014";
+  $("vm-latency").textContent = "agent " + (g.latency_ms !== undefined ? g.latency_ms + " ms" : "\u2014");
+
+  $("vm-cpu").innerHTML = pct(g.cpu.total) + "<small>%</small>";
+  setBar($("vm-cpu-bar"), g.cpu.total);
+  $("vm-cpu-note").textContent = g.cpu.count + " emulated cores \u00b7 no KVM";
+  $("vm-core-count").textContent = g.cpu.count + "\u00d7";
+
+  const m = g.memory;
+  if(m){
+    $("vm-mem").innerHTML = bytes(m.used) + "<small> / " + bytes(m.total) + "</small>";
+    setBar($("vm-mem-bar"), m.percent);
+    $("vm-mem-note").textContent = bytes(m.available) + " available";
+  }
+
+  const box = $("vm-cores");
+  box.innerHTML = "";
+  (g.cpu.cores||[]).forEach(c => {
+    const cell = document.createElement("div");
+    cell.className = "core";
+    const track = document.createElement("div");
+    track.className = "core-track";
+    const fill = document.createElement("div");
+    fill.className = "core-fill " + severity(c.percent);
+    fill.style.height = (c.percent || 0) + "%";
+    fill.style.background = severity(c.percent) ? "" : "var(--guest)";
+    track.appendChild(fill);
+    const idEl = document.createElement("div");
+    idEl.className = "core-id";
+    idEl.textContent = "v" + c.id;
+    const pctEl = document.createElement("div");
+    pctEl.className = "core-pct";
+    pctEl.textContent = pct(c.percent);
+    cell.append(track, idEl, pctEl);
+    box.appendChild(cell);
+  });
+
+  $("vm-disks").innerHTML = "";
+  (g.filesystems||[]).forEach(f => {
+    const chip = document.createElement("span");
+    chip.className = "chip " + severity(f.percent);
+    chip.innerHTML = f.mount + " <b>" + bytes(f.used) + "</b> / " + bytes(f.total) +
+      " \u00b7 " + f.percent + "%";
+    $("vm-disks").appendChild(chip);
+  });
+
+  renderPods(g.docker || {});
+}
+
+function renderPods(d){
+  const box = $("pods");
+  box.innerHTML = "";
+  const list = d.containers || [];
+  const running = list.filter(c => c.state === "running").length;
+  $("pod-count").textContent = list.length
+    ? running + " running of " + list.length
+    : "none";
+  $("pod-age").textContent = d.ts
+    ? "sampled " + Math.max(0, Math.round(Date.now()/1000 - d.ts)) + "s ago"
+    : "sampled \u2014";
+
+  if(d.error){
+    const n = document.createElement("div");
+    n.className = "notice is-bad";
+    n.textContent = "Docker unreachable: " + d.error;
+    box.appendChild(n);
+    return;
+  }
+  if(!list.length){
+    const n = document.createElement("div");
+    n.className = "notice";
+    n.textContent = "No containers yet. Start one with docker run and it appears here.";
+    box.appendChild(n);
+    return;
+  }
+
+  list.forEach(c => {
+    const row = document.createElement("div");
+    row.className = "pod";
+
+    const left = document.createElement("div");
+    left.innerHTML = '<div class="pod-name">' + c.name + '</div>' +
+                     '<div class="pod-image">' + c.image + '</div>';
+
+    const cpu = document.createElement("div");
+    cpu.innerHTML = '<div class="pod-caption">CPU</div>' +
+      '<div class="pod-figure">' + (c.cpu_percent === null ? "\u2014" : c.cpu_percent + "%") + '</div>';
+
+    const mem = document.createElement("div");
+    const mv = c.memory
+      ? bytes(c.memory.used) + (c.memory.percent !== null ? " \u00b7 " + c.memory.percent + "%" : "")
+      : "\u2014";
+    mem.innerHTML = '<div class="pod-caption">Memory</div>' +
+      '<div class="pod-figure">' + mv + '</div>';
+
+    const state = document.createElement("div");
+    state.className = "pod-state " + (c.state === "running" ? "is-up" : "is-down");
+    state.textContent = c.state || "?";
+    state.title = c.status || "";
+
+    row.append(left, cpu, mem, state);
+    box.appendChild(row);
+  });
+}
+
+/* ---------- poll loop ---------- */
+let misses = 0;
+
+async function tick(){
+  try{
+    const res = await fetch("/api/stats", {cache:"no-store"});
+    if(!res.ok) throw new Error("HTTP " + res.status);
+    const data = await res.json();
+    misses = 0;
+    $("banner").hidden = true;
+    $("pulse").classList.remove("is-stale");
+    $("pulse-text").textContent = "live";
+    renderHost(data.host);
+    renderGuest(data.guest);
+    $("subtitle").textContent =
+      "Android host \u2192 emulated guest \u2192 containers \u00b7 refreshed every " +
+      (POLL_MS/1000) + "s";
+  }catch(err){
+    misses++;
+    $("pulse").classList.add("is-stale");
+    $("pulse-text").textContent = "stale";
+    if(misses > 1){
+      const b = $("banner");
+      b.hidden = false;
+      b.textContent = "Lost contact with StackScope on the phone (" + err.message +
+        "). Check that dashboard.py is still running in tmux.";
+    }
+  }
+}
+
+tick();
+setInterval(tick, POLL_MS);
+</script>
+</body>
+</html>

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+*.gguf
+*.log
+registry.json
+guests.json
+id_ed25519*
+known_hosts

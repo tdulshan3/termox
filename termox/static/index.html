@@ -1,0 +1,42 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="color-scheme" content="light dark">
+<title>termox</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'><text y='13' font-size='13'>▚</text></svg>">
+<link rel="stylesheet" href="/static/app.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">
+    <span class="mark" aria-hidden="true"></span>
+    <span class="brand-name">termox</span>
+  </div>
+  <div class="topbar-meta" id="topbar-meta"></div>
+  <div class="topbar-actions">
+    <span class="pulse" id="pulse" title="Live"></span>
+    <button type="button" class="ghost" id="theme" aria-label="Switch theme">Theme</button>
+  </div>
+</header>
+
+<div class="shell">
+  <nav class="rail" id="rail" aria-label="Machines"></nav>
+  <main class="stage" id="stage" tabindex="-1"></main>
+</div>
+
+<div class="banner" id="banner" role="status" hidden></div>
+
+<template id="tpl-tile">
+  <div class="tile">
+    <div class="tile-label"></div>
+    <div class="tile-value"></div>
+    <div class="tile-sub"></div>
+  </div>
+</template>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
