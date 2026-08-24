@@ -60,6 +60,14 @@ def _cwd(pid):
         return None
 
 
+def _exe(pid):
+    """Absolute path of the running binary, from /proc/<pid>/exe."""
+    try:
+        return os.readlink("/proc/%d/exe" % pid)
+    except OSError:
+        return None
+
+
 def proc_sample(pid):
     """Jiffies + RSS for one pid, or None if it is gone."""
     try:

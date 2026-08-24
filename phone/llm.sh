@@ -32,8 +32,9 @@
 # client request can switch off.
 exec llama-server \
   -m $HOME/models/Qwen3.5-0.8B-Q4_0.gguf \
-  -t 4 -c 32768 --parallel 1 -b 256 --no-mmap \
-  --reasoning off \
+  -t 4 -c 131072 --parallel 1 -b 256 --no-mmap \
+  --reasoning on \
+  --reasoning-effort minimal \
   --host 0.0.0.0 --port 8081 \
   --metrics \
   --alias qwen3.5-0.8b

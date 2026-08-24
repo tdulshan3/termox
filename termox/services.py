@@ -17,6 +17,8 @@ from . import vms
 
 CPU_PORT = int(os.environ.get("TERMOX_LLM_CPU_PORT", "8081"))
 GPU_PORT = int(os.environ.get("TERMOX_LLM_GPU_PORT", "8082"))
+DNS_WEB_PORT = int(os.environ.get("TERMOX_DNS_WEB_PORT", "3000"))
+DNS_PORT = int(os.environ.get("TERMOX_DNS_PORT", "5300"))
 
 # Two model servers can run side by side: one on the CPU, one on the Adreno.
 # They are told apart by the port on their command line, because both are the
@@ -39,6 +41,19 @@ SERVICES = [
         "endpoint": "http://127.0.0.1:%d" % GPU_PORT,
         "kind": "llama.cpp on the Adreno",
         "uses_gpu": True,
+    },
+    {
+        "id": "dns",
+        "name": "DNS · AdGuard Home",
+        "exe": "AdGuardHome",
+        "port": DNS_WEB_PORT,
+        "endpoint": "http://127.0.0.1:%d" % DNS_WEB_PORT,
+        "kind": "AdGuard Home, native",
+        "uses_gpu": False,
+        "probe_port": DNS_PORT,
+        # AdGuard takes its listen port from the config file, so there is no
+        # --port on the command line to match against
+        "match_port": False,
     },
 ]
 
@@ -114,11 +129,17 @@ class Services:
             "metrics": None,
         }
 
-        pid, argv = find_process(spec["exe"], spec.get("port"))
+        pid, argv = find_process(
+            spec["exe"], spec.get("port") if spec.get("match_port", True) else None)
         if pid:
             entry["state"] = "running"
             entry["runtime"] = self._process(spec["id"], pid, interval)
             entry["model"] = _model_name(argv)
+
+        if spec["id"] == "dns":
+            # AdGuard has no /health; its liveness is whether the resolver
+            # port actually answers, which _render_dns establishes
+            return _render_dns(entry, spec)
 
         health = _fetch(spec["endpoint"] + "/health")
         if health is None:
@@ -189,6 +210,8 @@ class Services:
                                "stime": sample["stime"]}
         return {
             "pid": pid,
+            "binary": vms._exe(pid),
+            "directory": vms._cwd(pid),
             "cpu_percent": percent,
             "rss": sample["rss"],
             "threads": sample["threads"],
@@ -196,6 +219,52 @@ class Services:
             "cores": _affinity(pid),
             "nice": _nice(pid),
         }
+
+
+def _render_dns(entry, spec):
+    """AdGuard Home exposes /control/*, not Prometheus.
+
+    Everything under /control needs the web password once one is configured,
+    so query counts only appear if credentials are supplied. The parts that
+    matter for "is my DNS up" -- the process, and whether the resolver port
+    actually answers -- need no authentication at all.
+    """
+    entry["dns_port"] = spec.get("probe_port")
+    entry["dns_open"] = (vms.probe(spec["probe_port"])
+                         if spec.get("probe_port") else None)
+    if entry["state"] == "running" and not entry["dns_open"]:
+        entry["state"] = "starting"          # process up, resolver not yet bound
+
+    status = _fetch(spec["endpoint"] + "/control/status")
+    if status:
+        try:
+            data = json.loads(status)
+            entry["dns_version"] = data.get("version")
+            entry["protection"] = data.get("protection_enabled")
+            entry["dns_running"] = data.get("running")
+        except ValueError:
+            pass
+
+    stats = _fetch(spec["endpoint"] + "/control/stats")
+    if stats:
+        try:
+            data = json.loads(stats)
+            queries = data.get("num_dns_queries") or 0
+            blocked = ((data.get("num_blocked_filtering") or 0) +
+                       (data.get("num_replaced_safebrowsing") or 0) +
+                       (data.get("num_replaced_parental") or 0))
+            entry["dns_stats"] = {
+                "queries": queries,
+                "blocked": blocked,
+                "blocked_percent": (round(blocked * 100.0 / queries, 1)
+                                    if queries else None),
+                "avg_ms": round((data.get("avg_processing_time") or 0) * 1000, 2),
+            }
+        except ValueError:
+            pass
+    else:
+        entry["dns_stats"] = None
+    return entry
 
 
 def _model_name(argv):

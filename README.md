@@ -4,8 +4,8 @@ A control panel for everything running on a phone. It runs **in Termux on the
 phone itself** and answers on the LAN, so a browser anywhere in the house shows
 what the device, its virtual machines and its model servers are doing.
 
-Built for a Galaxy S20 (Snapdragon 865) running an Alpine VM under QEMU, an
-AdGuard container inside that VM, and two local LLM servers.
+Built for a Galaxy S20 (Snapdragon 865) running AdGuard Home and two local LLM
+servers, all natively -- no VM, no container, no root.
 
 ```
 browser  →  phone:8080   termox        (Termux, native, stdlib only)
@@ -13,7 +13,8 @@ browser  →  phone:8080   termox        (Termux, native, stdlib only)
                 ├─ /proc/<pid>         each qemu process
                 ├─ :8081 /metrics      model server on the CPU
                 ├─ :8082 /metrics      model server on the GPU
-                └─ ssh 127.0.0.1:2222  inside each guest
+                ├─ :3000 /control      AdGuard Home
+                └─ ssh 127.0.0.1:2222  inside each guest (when one exists)
 ```
 
 Stdlib only on both ends. No pip, no npm, no build step, and **nothing
@@ -108,6 +109,37 @@ pins to the *most throttled* ones. The permitted core set also moves — it was
 observed changing between two consecutive calls of the same script. The model
 servers are therefore left unpinned; only QEMU is confined and niced.
 
+### AdGuard Home runs natively, but only just
+
+The phone used to run a QEMU VM whose entire job was hosting one AdGuard
+container. Removing it freed **4.6 GB of RAM** and the 183-300% of a core that
+TCG emulation was burning; AdGuard itself uses **87 MB**. Three obstacles stood
+in the way, and the order they appeared in matters:
+
+- **The official ARM64 binary crashes instantly.** `SIGSYS: bad system call` on
+  syscall `0x1b7` = `faccessat2`, reached through `os/exec.LookPath`. Android's
+  seccomp filter kills the process rather than returning an error, which is why
+  stock Go binaries so often die on Termux.
+- **Termux's own Go toolchain fixes that** -- it targets `android/arm64`, not
+  `linux/arm64`. Compiling the exact failing call proved it before committing to
+  a full build. The web UI does not need building: AdGuard publishes
+  `AdGuardHome_frontend.tar.gz` alongside the binaries, which drops into
+  `build/static` for `go:embed` to pick up. Building it on-device instead means
+  fighting a `@types/react` mismatch that upstream's own `package.json` cannot
+  resolve (it omits `typescript` entirely).
+- **`bind_hosts: 0.0.0.0` is fatal**, and this one is not obvious. Expanding a
+  wildcard bind makes AdGuard enumerate interfaces via netlink, which Android
+  denies to apps -- `route ip+net: netlinkrib: permission denied`. Go's
+  `net.Interfaces()` returns nothing here for the same reason, so it cannot be
+  fixed in AdGuard. Binding *literal* addresses skips the enumeration entirely,
+  which is why `phone/adguard.sh` resolves the current LAN address itself and
+  writes it into the config on every start. The web listener needs the same
+  treatment, and its `address:` key is usually absent from the config, so it
+  has to be inserted rather than replaced.
+
+Port 53 still cannot be bound without root, so DNS answers on **5300** -- the
+same port the VM used to forward, so no client needed reconfiguring.
+
 ### Smaller findings worth keeping
 
 - **Context is allocated per slot.** llama-server gives each parallel slot the
@@ -170,9 +202,10 @@ termox/            the dashboard package (stdlib only)
   server.py        HTTP server and the sampler threads
   static/          the UI: hand-built SVG charts, no dependencies
 phone/             what runs on the phone outside the dashboard
+  adguard.sh       AdGuard Home, with the Android workarounds it needs
   llm.sh           CPU model server, with the measurements that justify it
   llm-gpu.sh       GPU model server on the Adreno
-  tune.sh          keeps QEMU out of the model servers' way
+  tune.sh          keeps heavy processes out of each other's way
   shim.c           the OpenCL 3.0 shim
   start-vm.sh      the Termux:Boot script that starts everything
 docs/OPERATIONS.md the full operational guide
@@ -208,16 +241,19 @@ tier, with the panels that cannot be read saying why.
 
 ![The host page](docs/img/host.png)
 
-**A machine.** Discovered from its command line, with its forwarded ports
-probed, its disk measured from the qcow2 header, and the guest read over SSH
-with nothing installed inside it — down to the containers.
-
-![A virtual machine](docs/img/machine.png)
+The host page ends with **Where things run** — every tracked app with the
+binary and working directory it was actually started from, read from `/proc`
+rather than inferred from the launch scripts.
 
 **A model server.** Throughput and processor trends, the runtime it actually
 got, and the endpoints to point a client at.
 
 ![A model server](docs/img/service.png)
+
+**DNS.** Whether the resolver is answering, on which port, and where the binary
+lives.
+
+![AdGuard Home](docs/img/dns.png)
 
 ## Status
 

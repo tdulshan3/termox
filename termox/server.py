@@ -10,6 +10,7 @@ Stdlib only.
 import json
 import mimetypes
 import os
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -103,11 +104,64 @@ class State:
         for stale in set(self.service_history) - keys:
             del self.service_history[stale]
 
+    @staticmethod
+    def _short(path):
+        """Termux paths all begin with the same 34 characters, which pushes
+        the interesting part of every row off the screen."""
+        if not path:
+            return path
+        prefix = os.environ.get("PREFIX")
+        home = os.environ.get("HOME")
+        if home and path.startswith(home):
+            return "~" + path[len(home):]
+        if prefix and path.startswith(prefix):
+            return "$PREFIX" + path[len(prefix):]
+        return path
+
+    def paths(self):
+        """Where every tracked app actually lives on disk.
+
+        Answering "which binary is this, and from where" needs /proc rather
+        than the launch scripts: a service may have been started by hand, from
+        a different copy, or with a config other than the one you expect.
+        """
+        rows = [{
+            "name": "termox",
+            "kind": "dashboard",
+            "binary": self._short(sys.executable),
+            "directory": self._short(HERE),
+            "detail": self._short(vms.REGISTRY_PATH),
+            "state": "running",
+        }]
+        for service in self.services:
+            runtime = service.get("runtime") or {}
+            rows.append({
+                "name": service["name"],
+                "kind": service.get("kind"),
+                "binary": self._short(runtime.get("binary")),
+                "directory": self._short(runtime.get("directory")),
+                "detail": self._short(service.get("model")) or service.get("endpoint"),
+                "state": service.get("state"),
+            })
+        for node in self.nodes:
+            spec = node.get("spec") or {}
+            disks = spec.get("disks") or []
+            rows.append({
+                "name": node["name"],
+                "kind": "virtual machine",
+                "binary": spec.get("binary"),
+                "directory": self._short(spec.get("cwd")),
+                "detail": self._short(disks[0]["path"]) if disks else None,
+                "state": node.get("state"),
+            })
+        return rows
+
     def snapshot(self):
         with self.lock:
             return {
                 "host": self.host,
                 "services": self.services,
+                "paths": self.paths(),
                 "nodes": self.nodes,
                 "guests": self.guests,
                 "history": {k: list(v) for k, v in self.history.items()},

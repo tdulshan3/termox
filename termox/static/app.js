@@ -463,6 +463,48 @@ function gpuCard(host) {
   ]);
 }
 
+function dnsTiles(service) {
+  const runtime = service.runtime || {};
+  const stats = service.dns_stats;
+  const tiles = [
+    tile('Resolver', service.dns_open ? 'up' : 'down',
+         '', 'port ' + (service.dns_port || '--'), true),
+    tile('Protection', service.protection === undefined ? '--'
+      : service.protection ? 'on' : 'off', '',
+      service.dns_version ? 'AdGuard ' + service.dns_version : ''),
+  ];
+  if (stats) {
+    tiles.push(tile('Queries', num(stats.queries), '', 'answered'));
+    tiles.push(tile('Blocked', num(stats.blocked), '',
+      stats.blocked_percent === null ? '' : pct(stats.blocked_percent, 1) + ' of queries'));
+    tiles.push(tile('Latency', num(stats.avg_ms, 1), ' ms', 'average'));
+  }
+  tiles.push(tile('Processor', num(runtime.cpu_percent), '%',
+    'of one phone core' + (runtime.pid ? ' · pid ' + runtime.pid : '')));
+  tiles.push(tile('Resident', bytes(runtime.rss), '',
+    runtime.threads ? runtime.threads + ' threads' : ''));
+  tiles.push(tile('Uptime', duration(runtime.uptime), '', ''));
+  return h('div', { class: 'tiles' }, tiles);
+}
+
+function dnsCard(service, host) {
+  const address = ((host || {}).identity || {}).address || 'this-phone';
+  return card('Resolver', 'point clients here', [
+    rows([
+      ['DNS', h('span', { class: 'mono',
+        text: address + ':' + (service.dns_port || '--') })],
+      ['Admin', h('span', { class: 'mono', text: (service.endpoint || '')
+        .replace('127.0.0.1', address) })],
+      ['Status', service.dns_open ? 'answering queries' : 'not answering'],
+    ]),
+    service.dns_stats ? null : h('div', { class: 'empty',
+      text: 'Query counts need the AdGuard web password, so they are not shown.' }),
+    h('div', { class: 'empty',
+      text: 'Port 53 needs root, so the resolver runs on '
+        + (service.dns_port || '5300') + '. Clients must be pointed at that port.' }),
+  ]);
+}
+
 function serviceTiles(service) {
   const runtime = service.runtime || {};
   const metrics = service.metrics || {};
@@ -528,6 +570,19 @@ function endpointCard(service, host) {
 function serviceDetailCard(service, host) {
   const runtime = service.runtime || {};
   const gpu = (host || {}).gpu || {};
+  if (service.id === 'dns') {
+    return card('Runtime', service.kind || null, [
+      rows([
+        service.dns_version ? ['Version', service.dns_version] : null,
+        ['Binary', h('span', { class: 'mono',
+          text: (runtime.binary || '--').split('/').pop() })],
+        ['Directory', h('span', { class: 'mono', text: runtime.directory || '--' })],
+        runtime.cores ? ['Cores', runtime.cores.join(', ')] : null,
+        runtime.nice === null || runtime.nice === undefined
+          ? null : ['Priority', 'nice ' + runtime.nice],
+      ]),
+    ]);
+  }
   return card('Runtime', service.kind || null, [
     rows([
       ['Model', service.model ? service.model.split('/').pop() : 'unknown'],
@@ -549,6 +604,7 @@ function renderService(data, service) {
   const stage = $('stage');
   stage.textContent = '';
   const running = service.state === 'running';
+  const isDns = service.id === 'dns';
 
   stage.appendChild(h('div', { class: 'stage-head' }, [
     h('h1', { class: 'stage-title', text: service.name }),
@@ -564,12 +620,12 @@ function renderService(data, service) {
     ]));
   }
 
-  stage.appendChild(serviceTiles(service));
+  stage.appendChild(isDns ? dnsTiles(service) : serviceTiles(service));
   const trend = serviceTrendCard(service);
   if (trend) stage.appendChild(trend);
   stage.appendChild(h('div', { class: 'grid two' }, [
     serviceDetailCard(service, data.host),
-    endpointCard(service, data.host),
+    isDns ? dnsCard(service, data.host) : endpointCard(service, data.host),
   ]));
 }
 
@@ -587,6 +643,30 @@ function sensorsCard(host) {
         ? [battery.percentage + '%', battery.status, battery.health,
            battery.celsius ? battery.celsius.toFixed(1) + ' °C' : null].filter(Boolean).join(' · ')
         : battery.reason || 'unavailable'],
+    ])]),
+  ]);
+}
+
+function pathsCard(data) {
+  const rows = data.paths || [];
+  if (!rows.length) return null;
+  return card('Where things run', 'binaries and working directories, read from /proc', [
+    h('div', { class: 'table-scroll' }, [h('table', {}, [
+      h('thead', {}, [h('tr', {}, [
+        h('th', { text: 'App' }), h('th', { text: 'Kind' }),
+        h('th', { text: 'Binary' }), h('th', { text: 'Directory' }),
+        h('th', { text: 'Data' }),
+      ])]),
+      h('tbody', {}, rows.map((r) => h('tr', {}, [
+        h('td', {}, [
+          h('span', { class: 'pill ' + (r.state === 'running' ? 'good' : 'idle') },
+            [h('i'), r.name]),
+        ]),
+        h('td', { text: r.kind || '--' }),
+        h('td', { class: 'mono wrap', text: r.binary || 'not running' }),
+        h('td', { class: 'mono wrap', text: r.directory || '--' }),
+        h('td', { class: 'mono wrap', text: r.detail || '--' }),
+      ]))),
     ])]),
   ]);
 }
@@ -624,6 +704,7 @@ function renderHost(data) {
     [gpuCard(host), storageCard(host)],
     [networkCard(host, data.history), sensorsCard(host)],
     [deviceCard(host), null],
+    [pathsCard(data), null],
   ];
   pairs.forEach((row) => {
     const cards = row.filter(Boolean);
@@ -908,6 +989,9 @@ function renderRail(data) {
           text: service.state === 'running' ? pct(runtime.cpu_percent) : '' }),
         h('span', { class: 'node-sub',
           text: service.state !== 'running' ? service.state
+            : service.id === 'dns'
+              ? (service.dns_open ? 'resolving on ' + service.dns_port : 'port closed')
+                + ' · ' + bytes(runtime.rss)
             : metrics.processing ? 'answering now'
             : rate ? num(rate, 1) + ' tok/s · ' + bytes(runtime.rss) : bytes(runtime.rss) }),
       ]));
