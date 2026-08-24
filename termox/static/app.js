@@ -633,7 +633,7 @@ function poster(data) {
           style: 'font-family:var(--font-heading);font-weight:800;font-size:25px;line-height:1.12',
           text: 'Nothing wants you',
         }),
-        h('span', { style: 'font-size:12px;opacity:.85',
+        h('span', { style: 'font-size:12px',
                     text: 'every service up, nothing over its threshold' }),
       ]),
     ]);
@@ -646,7 +646,7 @@ function poster(data) {
         style: 'font-family:var(--font-heading);font-weight:800;font-size:25px;line-height:1.12',
         text: alerts.length + (alerts.length === 1 ? ' thing wants you' : ' things want you'),
       }),
-      h('span', { style: 'font-size:12px;opacity:.85',
+      h('span', { style: 'font-size:12px',
                   text: alerts.length > 3
                     ? 'derived from what was just sampled · ' + (alerts.length - 3) + ' more below'
                     : 'derived from what was just sampled' }),
@@ -664,7 +664,7 @@ function poster(data) {
       style: 'background:var(--color-accent);padding:12px 14px',
     }, [
       h('div', { style: 'font-family:var(--font-heading);font-weight:800;font-size:15px', text: alert.title }),
-      h('div', { style: 'font-size:12px;opacity:.9', text: alert.detail }),
+      h('div', { style: 'font-size:12px', text: alert.detail }),
     ]))),
   ]);
 }

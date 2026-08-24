@@ -251,7 +251,9 @@ would change the character of the type.
 
 Both grounds ship. The dark one reverses the neutral and accent ramps on their
 shared lightness scale so every step keeps its weight, and `?theme=light`
-carries a choice in a link.
+carries a choice in a link. Anything filled with the accent -- the attention
+band, primary buttons, the selected window -- carries white type in either
+theme, so an orange surface reads the same whichever ground is under it.
 
 The mark is an SVG so it stays sharp at the 24px it renders in the header and
 at favicon size, and it takes its ink from a CSS variable so the same file
