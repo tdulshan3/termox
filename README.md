@@ -148,11 +148,33 @@ same port the VM used to forward, so no client needed reconfiguring.
   full `-c`, so `-c 32768` alone tries to allocate several. Paired with
   `--parallel 1`, 32k context costs about 0.2 GB. Verified with a 7,015-token
   prompt at 32.9 tok/s.
-- **Reasoning must stay off on a 0.8B model.** With it on, "name three colours"
-  consumed 600 tokens of thinking and never answered; a genuine maths question
-  consumed 1,200. `off` is only a default though — a client can still opt in per
-  call with `chat_template_kwargs: {"enable_thinking": true}`, whereas
-  `--reasoning on` cannot be switched off by any request.
+- **A 0.8B model cannot close its own thinking block, and the trivial prompts
+  are the ones that run away.** With reasoning on and nothing bounding it,
+  "name three colours" and "write one sentence about rain" both enumerated
+  alternatives until they hit the context limit and returned *empty* content,
+  while "what is 17 * 23?" terminated on its own in 331 tokens. The model loops
+  when it has nothing to reason about, so a smoke test built from arithmetic
+  misses the bug entirely. 7 of 12 unbounded runs came back empty.
+
+  `--reasoning-budget` is the fix, and it is the only thing that worked. It
+  forces the closing tag as a sampler, not through the template, so it fires
+  however thinking was enabled: across 114 budgeted runs, zero empty replies,
+  and it held through hostile "consider at least 25 alternatives" prompts, four
+  languages, five-turn histories and an injected unclosed `<think>` block.
+  `--reasoning-budget-message` is required alongside it, and the *two leading
+  newlines* matter more than the wording — the budget cuts mid-token, and
+  without them one run was severed inside "6150" and another leaked a literal
+  `</think>` into the answer.
+
+  Four things that look like fixes and are not, all measured: `--reasoning-effort`
+  is a no-op (`/props` reports `supports_reasoning_effort: false`); `-n` never
+  registers in this build, so `-c` is the only ceiling a client cannot raise;
+  `--reasoning off` is not a safe default, because the advertised opt-in path
+  reproduces the runaway unguarded *and* answers 17\*23 as 491 where budgeted
+  reasoning answers 391; and Qwen's own published thinking-mode sampling was the
+  worst configuration tested, 0 for 3, all empty — it stops the repetition and
+  the model explores forever instead. Repeat-penalty and DRY made it worse still.
+  Stock sampling, unchanged, plus a budget.
 - **llama.cpp resets its `/metrics` per-second gauges on scrape**, so anything
   polling them frequently reads zero forever. Worse, the underlying counters
   only advance when a request *completes*, so a naive delta reads zero during
