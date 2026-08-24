@@ -201,7 +201,8 @@ termox/            the dashboard package (stdlib only)
   host.py          Android host readers, with the fallbacks above
   vms.py           QEMU discovery and the persistent machine registry
   guestlink.py     agentless in-guest collection over SSH
-  services.py      model servers: process facts + Prometheus scraping
+  services.py      model servers and DNS: process facts, metrics, probes
+  control.py       start / stop / restart as jobs with running commentary
   server.py        HTTP server and the sampler threads
   static/          the UI: hand-built SVG charts, no dependencies
 phone/             what runs on the phone outside the dashboard
@@ -209,6 +210,7 @@ phone/             what runs on the phone outside the dashboard
   llm.sh           CPU model server, with the measurements that justify it
   llm-gpu.sh       GPU model server on the Adreno
   tune.sh          keeps heavy processes out of each other's way
+  vm.sh            the Alpine VM, kept for Docker work
   shim.c           the OpenCL 3.0 shim
   start-vm.sh      the Termux:Boot script that starts everything
 docs/OPERATIONS.md the full operational guide
@@ -258,8 +260,36 @@ lives.
 
 ![AdGuard Home](docs/img/dns.png)
 
+## Starting and stopping things
+
+Every managed thing is a tmux session running a launcher script, so the panel
+can start, stop and restart machines and services. Actions are **jobs**, not
+blocking requests, because a model server takes half a minute to load weights
+and a VM takes two: each action reports what it is doing while it does it
+("asking the guest to power off", "waiting for a clean shutdown", "booting the
+guest"), and a restart tracks its own phase so it stops saying "stopping" once
+it starts.
+
+Two details matter more than they look:
+
+- **A TCP connect does not mean a VM is ready.** QEMU accepts on its forwarded
+  ports the moment it starts, long before the guest boots, so a connect
+  reported success in one second. Readiness for a machine comes from reading
+  sshd's greeting instead.
+- **A failed start says why.** The launcher's output is captured, so when
+  QEMU refused to start because AdGuard had taken port 3000, the panel showed
+  `Could not set up host forwarding rule` rather than timing out silently.
+
+Transitional state is inferred as well as tracked: a process that is up but
+not yet answering on its port reads as *starting* even if it was launched from
+a terminal rather than from here, and the buttons disable accordingly.
+
+**The control endpoints are as open as the rest of the panel.** Anyone on the
+network can stop your DNS unless `TERMOX_TOKEN` is set, and the host page says
+so plainly until it is.
+
 ## Status
 
-Reading works. Creating, starting and connecting to machines is the next piece
-of work, and the registry underneath is built for it. Machines already report
-whether they expose a QMP socket, which is the prerequisite.
+Reading and lifecycle control work. Creating machines from scratch is the
+remaining piece; the registry underneath is built for it, and machines already
+report whether they expose a QMP socket, which is the prerequisite.

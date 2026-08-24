@@ -15,7 +15,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import host, vms
+from . import control, host, vms
 from .guestlink import GuestLink
 from .services import Services
 
@@ -52,6 +52,7 @@ class State:
         self.link = GuestLink()
         self.services = []
         self.service_poller = Services()
+        self.jobs = control.Jobs()
         self.service_history = {}
         self.storage = []
 
@@ -161,12 +162,35 @@ class State:
             })
         return rows
 
+    def with_jobs(self, items, prefix):
+        """Overlay any in-flight action onto what the sampler last saw.
+
+        A service that is mid-restart is neither running nor stopped, and
+        saying so is the whole point of showing actions in the panel.
+        """
+        for item in items:
+            key = prefix + str(item.get("id") if prefix == "svc:" else item.get("key"))
+            job = self.jobs.active_for(key)
+            if job:
+                item["job"] = {"action": job["action"], "message": job["message"],
+                               "phase": job.get("phase"), "state": job["state"],
+                               "started": job["started"]}
+                item["state"] = job.get("phase") or (
+                    "starting" if job["action"] == "start" else "stopping")
+            else:
+                item["job"] = None
+        return items
+
     def snapshot(self):
         with self.lock:
+            self.with_jobs(self.services, "svc:")
+            self.with_jobs(self.nodes, "")
             return {
                 "host": self.host,
                 "services": self.services,
                 "paths": self.paths(),
+                "jobs": self.jobs.listing(),
+                "control": {"enabled": True, "token_required": bool(TOKEN)},
                 "nodes": self.nodes,
                 "guests": self.guests,
                 "history": {k: list(v) for k, v in self.history.items()},
@@ -315,6 +339,53 @@ def guest_loop():
 
 # ------------------------------------------------------------------ http
 
+def control_spec(target):
+    """Turn a UI target into something control.Jobs can act on."""
+    if not target:
+        return None
+    if target.startswith("svc:"):
+        spec = control.SERVICES.get(target[4:])
+        if not spec:
+            return None
+        spec = dict(spec)
+        with STATE.lock:
+            match = [s for s in STATE.services if "svc:" + s["id"] == target]
+        spec["label"] = match[0]["name"] if match else target
+        return spec
+
+    with STATE.lock:
+        nodes = [n for n in STATE.nodes if n["key"] == target]
+    if not nodes:
+        return None
+    node = nodes[0]
+    session, command = control.node_launcher(node)
+    spec = {
+        "session": session, "command": command, "label": node["name"],
+        "exe": (node.get("spec") or {}).get("binary") or "qemu-system-aarch64",
+        "match": None,
+        "probe": next((p["host_port"] for p in node.get("ports", [])
+                       if p["proto"] == "tcp" and p["guest_port"] == 22), None),
+        # QEMU opens its forwarded ports immediately, so readiness has to come
+        # from the guest's own ssh greeting rather than a TCP connect
+        "probe_kind": "banner",
+        "waiting": "booting the guest",
+        "ready": "the guest has booted and ssh is answering",
+    }
+    # a virtual machine gets the chance to shut its filesystem down cleanly
+    ssh_port = spec["probe"]
+    if ssh_port:
+        from .guestlink import ssh_command
+        spec["graceful"] = {
+            "message": "asking the guest to power off",
+            "command": ssh_command({"host": "127.0.0.1", "port": ssh_port,
+                                    "user": "root",
+                                    "key": os.path.join(vms.TERMOX_HOME, "id_ed25519")})
+                       + ["poweroff"],
+            "timeout": 45,
+        }
+    return spec
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = "termox"
@@ -342,6 +413,33 @@ class Handler(BaseHTTPRequestHandler):
             return True
         return query.get("token") == TOKEN
 
+    def do_POST(self):                                  # noqa: N802 - stdlib API
+        path, _, raw_query = self.path.partition("?")
+        query = dict(
+            part.split("=", 1) if "=" in part else (part, "")
+            for part in raw_query.split("&") if part)
+        if not self._authorised(query):
+            return self._json({"error": "token required"}, 401)
+        if path != "/api/control":
+            return self._send(404, b"not found", "text/plain")
+
+        try:
+            length = int(self.headers.get("Content-Length") or 0)
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except (ValueError, OSError):
+            return self._json({"error": "unreadable request"}, 400)
+
+        target, action = body.get("target"), body.get("action")
+        if action not in ("start", "stop", "restart"):
+            return self._json({"error": "unknown action"}, 400)
+
+        spec = control_spec(target)
+        if not spec:
+            return self._json({"error": "nothing controllable called %r" % target}, 404)
+
+        job, note = STATE.jobs.run(target, action, spec)
+        return self._json({"job": job, "note": note})
+
     def do_GET(self):                                   # noqa: N802 - stdlib API
         path, _, raw_query = self.path.partition("?")
         query = dict(
@@ -356,12 +454,17 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/host":
             with STATE.lock:
                 return self._json(STATE.host or {})
+        if path == "/api/jobs":
+            return self._json({"jobs": STATE.jobs.listing()})
         if path == "/api/services":
             with STATE.lock:
-                return self._json({"services": STATE.services})
+                # same overlay the full snapshot applies, so both endpoints
+                # agree about what is mid-action
+                return self._json({"services": STATE.with_jobs(STATE.services, "svc:")})
         if path == "/api/nodes":
             with STATE.lock:
-                return self._json({"nodes": STATE.nodes, "guests": STATE.guests})
+                return self._json({"nodes": STATE.with_jobs(STATE.nodes, ""),
+                                   "guests": STATE.guests})
         if path == "/api/health":
             return self._json({"ok": True, "uptime": time.time() - STATE.started})
         if path in ("/", "/index.html"):

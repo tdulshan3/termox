@@ -301,6 +301,120 @@ function sparkline(series, opts) {
   return wrap;
 }
 
+/* -------------------------------------------------------------- control */
+
+const pending = new Set();      // targets with a request in flight locally
+
+async function act(target, action, label) {
+  if (pending.has(target)) return;
+  pending.add(target);
+  toast('working', label, action + 'ing');
+  render();
+  try {
+    const response = await fetch('/api/control', {
+      method: 'POST',
+      headers: Object.assign({ 'Content-Type': 'application/json' },
+                             TOKEN ? { 'X-Termox-Token': TOKEN } : {}),
+      body: JSON.stringify({ target: target, action: action }),
+    });
+    const data = await response.json();
+    if (!response.ok) throw new Error(data.error || 'refused');
+    if (data.note) toast('working', label, data.note);
+  } catch (err) {
+    toast('critical', label, err.message);
+  } finally {
+    pending.delete(target);
+    poll();
+  }
+}
+
+/* A thing is in transition when we asked for it, or when the sampler can see
+   the process but it is not answering yet -- which also covers something
+   started from a terminal rather than from here. Offering "Start" during that
+   window is the wrong answer to the wrong question. */
+function transitional(state) {
+  return state === 'starting' || state === 'stopping';
+}
+
+function actionBar(target, state, job, label) {
+  const busy = !!job || pending.has(target) || transitional(state);
+
+  if (busy) {
+    return h('div', { class: 'actions' }, [
+      h('button', { class: 'action', type: 'button', disabled: true }, [
+        h('span', { class: 'dot-spin' }),
+        state === 'stopping' ? 'Stopping' : 'Starting',
+      ]),
+    ]);
+  }
+
+  if (state !== 'running') {
+    return h('div', { class: 'actions' }, [
+      h('button', {
+        class: 'action primary', type: 'button',
+        onclick: () => act(target, 'start', label),
+      }, ['Start']),
+    ]);
+  }
+
+  return h('div', { class: 'actions' }, [
+    h('button', {
+      class: 'action', type: 'button',
+      onclick: () => act(target, 'restart', label),
+    }, ['Restart']),
+    h('button', {
+      class: 'action danger', type: 'button',
+      onclick: () => act(target, 'stop', label),
+    }, ['Stop']),
+  ]);
+}
+
+function activityStrip(job, state) {
+  if (!job && !transitional(state)) return null;
+  const phase = job && job.phase;
+  const verb = job
+    ? (phase === 'stopping' ? 'Stopping'
+       : phase === 'starting' ? (job.action === 'restart' ? 'Restarting' : 'Starting')
+       : 'Working')
+    : (state === 'stopping' ? 'Stopping' : 'Starting');
+  const detail = job ? job.message
+    : 'the process is up but not answering on its port yet';
+  return h('div', { class: 'activity' }, [
+    h('span', { class: 'pulse-ring' }),
+    h('span', { text: verb }),
+    h('span', { class: 'what', text: detail }),
+  ]);
+}
+
+/* ---------------------------------------------------------------- toasts */
+
+const toastBox = h('div', { class: 'toasts' });
+document.body.appendChild(toastBox);
+const seenJobs = new Map();
+
+function toast(level, title, detail, ttl) {
+  const node = h('div', { class: 'toast ' + level }, [
+    h('i'),
+    h('div', { class: 'body' }, [
+      h('div', { class: 'title', text: title }),
+      detail ? h('div', { class: 'detail', text: detail }) : null,
+    ].filter(Boolean)),
+  ]);
+  toastBox.appendChild(node);
+  setTimeout(() => node.remove(), ttl || (level === 'working' ? 4000 : 7000));
+}
+
+/* Announce jobs that finished while we were watching, once each. */
+function announceJobs(jobs) {
+  (jobs || []).forEach((job) => {
+    const was = seenJobs.get(job.id);
+    seenJobs.set(job.id, job.state);
+    if (was && was !== job.state && job.state !== 'running') {
+      toast(job.state === 'done' ? 'good' : 'critical', job.label, job.message);
+    }
+  });
+}
+
 /* ---------------------------------------------------------------- views */
 
 function hostTiles(host, nodes) {
@@ -635,19 +749,19 @@ function renderService(data, service) {
   const running = service.state === 'running';
   const isDns = service.id === 'dns';
 
+  const target = 'svc:' + service.id;
   stage.appendChild(h('div', { class: 'stage-head' }, [
     h('h1', { class: 'stage-title', text: service.name }),
-    pill(service.state, running ? 'good'
-      : service.state === 'starting' ? 'warning' : 'idle'),
-    h('span', { class: 'stage-note',
-      text: running ? '' : 'the process is not answering on its port' }),
+    pill(service.job ? service.state : service.state,
+      running ? 'good' : service.state === 'starting' ? 'warning'
+        : service.state === 'stopping' ? 'warning' : 'idle'),
+    h('div', { style: 'margin-left:auto' }, [
+      actionBar(target, service.state, service.job, service.name),
+    ]),
   ]));
 
-  if (!running) {
-    stage.appendChild(h('div', { class: 'later' }, [
-      'Start it with ~/llm.sh on the phone, or reboot -- it is in the boot script.',
-    ]));
-  }
+  const strip = activityStrip(service.job, service.state);
+  if (strip) stage.appendChild(strip);
 
   stage.appendChild(isDns ? dnsTiles(service) : serviceTiles(service, data.host));
   const trend = serviceTrendCard(service);
@@ -673,6 +787,25 @@ function sensorsCard(host) {
            battery.celsius ? battery.celsius.toFixed(1) + ' °C' : null].filter(Boolean).join(' · ')
         : battery.reason || 'unavailable'],
     ])]),
+  ]);
+}
+
+function activityCard(data) {
+  const jobs = (data.jobs || []).slice(0, 6);
+  if (!jobs.length) return null;
+  return card('Recent actions', 'start and stop history since the panel came up', [
+    h('div', { class: 'rows' }, jobs.map((job) => h('div', { class: 'row' }, [
+      h('dt', {}, [
+        pill(job.action, job.state === 'done' ? 'good'
+          : job.state === 'failed' ? 'critical' : 'warning'),
+        h('span', { style: 'margin-left:8px', text: job.label }),
+      ]),
+      h('dd', {}, [
+        h('span', { class: 'meter-label', text: job.message }),
+        h('span', { style: 'color:var(--muted); margin-left:10px',
+          text: ago((Date.now() / 1000) - job.started) }),
+      ]),
+    ]))),
   ]);
 }
 
@@ -726,6 +859,12 @@ function renderHost(data) {
     h('h1', { class: 'stage-title', text: id.device || id.hostname || 'This phone' }),
     h('span', { class: 'stage-note', text: 'the machine everything else runs on' }),
   ]));
+  if ((data.control || {}).enabled && !(data.control || {}).token_required) {
+    stage.appendChild(h('div', { class: 'notice' }, [
+      h('span', {}, [h('b', { text: 'Anyone on this network can start and stop these. ' }),
+        'Set TERMOX_TOKEN to require a token.']),
+    ]));
+  }
   stage.appendChild(hostTiles(host, data.nodes || []));
 
   const pairs = [
@@ -733,6 +872,7 @@ function renderHost(data) {
     [gpuCard(host), storageCard(host)],
     [networkCard(host, data.history), sensorsCard(host)],
     [deviceCard(host), null],
+    [activityCard(data), null],
     [pathsCard(data), null],
   ];
   pairs.forEach((row) => {
@@ -922,18 +1062,18 @@ function renderVm(data, node) {
   const running = node.state === 'running';
   stage.appendChild(h('div', { class: 'stage-head' }, [
     h('h1', { class: 'stage-title', text: node.name }),
-    pill(running ? 'running' : 'stopped', running ? 'good' : 'idle'),
+    pill(node.state, running ? 'good'
+      : node.state === 'starting' || node.state === 'stopping' ? 'warning' : 'idle'),
     h('span', { class: 'stage-note',
-      text: running ? '' : 'last seen ' + (node.last_seen
+      text: running || node.job ? '' : 'last seen ' + (node.last_seen
         ? ago((Date.now() / 1000) - node.last_seen) : 'never') }),
+    h('div', { style: 'margin-left:auto' }, [
+      actionBar(node.key, node.state, node.job, node.name),
+    ]),
   ]));
 
-  if (!running) {
-    stage.appendChild(h('div', { class: 'later' }, [
-      'This machine is remembered but not running. Starting it from here is the next '
-      + 'piece of work; for now bring it up the way you always have.',
-    ]));
-  }
+  const strip = activityStrip(node.job, node.state);
+  if (strip) stage.appendChild(strip);
 
   stage.appendChild(vmTiles(node, guest));
   if (running && (node.history || {}).cpu) stage.appendChild(vmTrendCard(node, guest));
@@ -1078,6 +1218,7 @@ async function poll() {
     });
     if (!response.ok) throw new Error('HTTP ' + response.status);
     state.data = await response.json();
+    announceJobs(state.data.jobs);
     state.failures = 0;
     document.body.classList.remove('stale-data');
     $('pulse').classList.remove('stale');
