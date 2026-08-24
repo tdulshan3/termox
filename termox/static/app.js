@@ -438,13 +438,13 @@ function header(data) {
   const up = (list) => list.filter((x) => x.state === 'running').length;
   const control = data.control || {};
 
+  /* The chip stays ink in both grounds, which is what lets the mark keep its
+     paper stroke without a second asset. */
   const chip = h('span', {
     style: 'width:30px;height:30px;flex:none;display:grid;place-items:center;background:#1c1a19',
   }, [
-    h('span', {
-      style: 'font-family:var(--font-heading);font-weight:800;font-size:18px;color:#f87800',
-      text: 't',
-    }),
+    h('img', { src: 'termox-logo.svg', alt: '', width: '24', height: '24',
+               style: 'display:block' }),
   ]);
 
   return h('header', {
@@ -647,7 +647,9 @@ function poster(data) {
         text: alerts.length + (alerts.length === 1 ? ' thing wants you' : ' things want you'),
       }),
       h('span', { style: 'font-size:12px;opacity:.85',
-                  text: 'derived from what was just sampled' }),
+                  text: alerts.length > 3
+                    ? 'derived from what was just sampled · ' + (alerts.length - 3) + ' more below'
+                    : 'derived from what was just sampled' }),
       h('span', { style: 'margin-left:auto;display:flex;gap:8px' }, [
         h('button', {
           type: 'button', class: 'btn btn-secondary', style: 'justify-content:flex-start',
@@ -658,7 +660,7 @@ function poster(data) {
     h('div', {
       style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:2px;'
            + 'margin-top:16px;background:color-mix(in srgb,var(--tx-on-accent) 28%,transparent)',
-    }, alerts.slice(0, 4).map((alert) => h('div', {
+    }, alerts.slice(0, 3).map((alert) => h('div', {
       style: 'background:var(--color-accent);padding:12px 14px',
     }, [
       h('div', { style: 'font-family:var(--font-heading);font-weight:800;font-size:15px', text: alert.title }),
@@ -713,11 +715,11 @@ function renderOverview(data) {
 
   out.push(h('div', {
     'data-tx-strip': 'true',
-    style: 'display:grid;grid-template-columns:minmax(0,1fr);border-bottom:' + DIV,
+    style: 'display:grid;grid-template-columns:minmax(0,1fr) 232px;border-bottom:' + DIV,
   }, [
     h('div', {
       style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:2px;'
-           + 'background:var(--color-divider)',
+           + 'background:var(--color-divider);border-right:' + DIV,
     }, [
       stat('Processor', num(cpu.total), '%',
            (cpu.count || 0) + ' cores · ' + (cpu.governor || 'unknown'), 'blue'),
@@ -736,6 +738,7 @@ function renderOverview(data) {
                      ' ' + bytes(storage.free).split(' ')[1],
                      'free of ' + bytes(storage.total)) : null,
     ].filter(Boolean)),
+    deviceFigure(host),
   ]));
 
   const cpuValues = readingFor('cpu');
@@ -825,6 +828,31 @@ function wiringSection(data) {
       h('div', { style: 'background:var(--color-bg);padding:12px 14px 14px 34px' }, [
         dl(rows.map(([k, v]) => [k, v])),
       ]),
+    ]),
+  ]);
+}
+
+/* The design puts the device itself beside the readings. The photo is a
+   Wikimedia Commons render under CC BY 4.0, which is why the credit is in the
+   caption rather than buried in a comment. */
+function deviceFigure(host) {
+  const id = host.identity || {};
+  return h('figure', { style: 'margin:0;padding:16px 18px' }, [
+    h('div', {
+      class: 'grayscale',
+      style: 'width:100%;height:196px;display:grid;place-items:center;overflow:hidden;'
+           + 'background:var(--color-surface)',
+    }, [
+      h('img', { src: 'phone.png', alt: id.device || 'the phone', width: 74, height: 168,
+                 style: 'height:168px;width:auto;display:block' }),
+    ]),
+    h('figcaption', { style: 'margin-top:6px' }, [
+      [id.device, id.soc, 'running everything natively'].filter(Boolean).join(' · '),
+      h('br'),
+      h('a', {
+        href: 'https://commons.wikimedia.org/wiki/File:Galaxy_S20_(cropped).png',
+        target: '_blank', rel: 'noreferrer', text: 'Photo: GadgetsGuy, CC BY 4.0',
+      }),
     ]),
   ]);
 }

@@ -1,3 +1,5 @@
+<img src="termox/static/termox-logo.svg" width="72" alt="">
+
 # termox
 
 A control panel for everything running on a phone. It runs **in Termux on the
@@ -251,6 +253,14 @@ Both grounds ship. The dark one reverses the neutral and accent ramps on their
 shared lightness scale so every step keeps its weight, and `?theme=light`
 carries a choice in a link.
 
+The mark is an SVG so it stays sharp at the 24px it renders in the header and
+at favicon size, and it takes its ink from a CSS variable so the same file
+works on either ground. The one photograph on the panel is the device itself,
+desaturated to the system's photo treatment: [Galaxy S20 by GadgetsGuy][photo],
+CC BY 4.0, vendored so the panel still draws with no route to the internet.
+
+[photo]: https://commons.wikimedia.org/wiki/File:Galaxy_S20_(cropped).png
+
 ## Screenshots
 
 The sidebar groups everything into **Host**, **Machines** and **Services**, and
@@ -281,6 +291,11 @@ and a box that sends one real request so the panel can show what it measured.
 lives.
 
 ![AdGuard Home](docs/img/dns.png)
+
+**Narrow.** Below 900px the rail unpins and the whole panel becomes one column,
+so the phone serving all of this can also be the thing reading it.
+
+<img src="docs/img/mobile.png" width="300" alt="The overview on a phone-width screen">
 
 ## Starting and stopping things
 
