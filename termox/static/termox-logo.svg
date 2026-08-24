@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="termox">
+  <!-- A terminal prompt in paper, and the two right arms of an X in the brand
+       orange. The arms tuck above and below the chevron's apex so the pair
+       reads as one X, with a diagonal gap holding them apart. Strokes rather
+       than outlines, so the mark stays sharp at 30px in the header. -->
+  <g fill="none" stroke-linejoin="round">
+    <path d="M96 112 L266 256 L96 400"
+          stroke="var(--tx-mark, #f8f4f4)" stroke-width="62" stroke-linecap="round"/>
+    <path d="M110 256 L192 256"
+          stroke="var(--tx-mark, #f8f4f4)" stroke-width="32" stroke-linecap="round"/>
+    <path d="M286 202 L430 92"
+          stroke="#f87800" stroke-width="62" stroke-linecap="butt"/>
+    <path d="M286 310 L430 420"
+          stroke="#f87800" stroke-width="62" stroke-linecap="butt"/>
+  </g>
+</svg>
