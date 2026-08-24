@@ -154,6 +154,11 @@ function meter(label, value, percent, opts) {
   return row;
 }
 
+function link(href, text, className) {
+  return h('a', { class: className || 'link', href: href,
+                  target: '_blank', rel: 'noreferrer', text: text });
+}
+
 function pill(text, level) {
   return h('span', { class: 'pill ' + (level || '') }, [h('i'), text]);
 }
@@ -469,10 +474,13 @@ function dnsTiles(service) {
   const tiles = [
     tile('Resolver', service.dns_open ? 'up' : 'down',
          '', 'port ' + (service.dns_port || '--'), true),
-    tile('Protection', service.protection === undefined ? '--'
-      : service.protection ? 'on' : 'off', '',
-      service.dns_version ? 'AdGuard ' + service.dns_version : ''),
   ];
+  // filtering state comes from an authenticated endpoint; a permanent "--"
+  // tile is worse than no tile
+  if (service.protection !== undefined && service.protection !== null) {
+    tiles.push(tile('Filtering', service.protection ? 'on' : 'off', '',
+      service.dns_version ? 'AdGuard ' + service.dns_version : ''));
+  }
   if (stats) {
     tiles.push(tile('Queries', num(stats.queries), '', 'answered'));
     tiles.push(tile('Blocked', num(stats.blocked), '',
@@ -489,25 +497,35 @@ function dnsTiles(service) {
 
 function dnsCard(service, host) {
   const address = ((host || {}).identity || {}).address || 'this-phone';
+  const admin = (service.endpoint || '').replace('127.0.0.1', address);
+  const resolver = address + ':' + (service.dns_port || '--');
+
   return card('Resolver', 'point clients here', [
-    rows([
-      ['DNS', h('span', { class: 'mono',
-        text: address + ':' + (service.dns_port || '--') })],
-      ['Admin', h('span', { class: 'mono', text: (service.endpoint || '')
-        .replace('127.0.0.1', address) })],
-      ['Status', service.dns_open ? 'answering queries' : 'not answering'],
+    h('div', { style: 'margin-bottom:16px' }, [
+      link(admin, 'Open the AdGuard admin →', 'open-button'),
     ]),
-    service.dns_stats ? null : h('div', { class: 'empty',
-      text: 'Query counts need the AdGuard web password, so they are not shown.' }),
+    rows([
+      ['DNS server', h('span', { class: 'mono', text: resolver })],
+      ['Admin', link(admin, admin)],
+      ['Status', service.dns_open
+        ? pill('answering queries', 'good') : pill('not answering', 'critical')],
+      service.protection === undefined || service.protection === null ? null
+        : ['Filtering', service.protection ? pill('on', 'good') : pill('off', 'warning')],
+    ]),
     h('div', { class: 'empty',
-      text: 'Port 53 needs root, so the resolver runs on '
-        + (service.dns_port || '5300') + '. Clients must be pointed at that port.' }),
+      text: 'Port 53 needs root, so the resolver listens on '
+        + (service.dns_port || '5300') + '. Clients have to name that port '
+        + 'explicitly; most routers allow it, most phones do not.' }),
+    service.dns_stats ? null : h('div', { class: 'empty',
+      text: 'Query and block counts live behind the AdGuard login, so they are '
+        + 'shown in the admin rather than here.' }),
   ]);
 }
 
-function serviceTiles(service) {
+function serviceTiles(service, host) {
   const runtime = service.runtime || {};
   const metrics = service.metrics || {};
+  const gpu = (host || {}).gpu || {};
   // The per-second gauge is reset by llama.cpp whenever /metrics is read, so
   // it is usually zero by the time the UI sees it. The lifetime average,
   // derived from monotonic counters, is the number that is always true.
@@ -526,6 +544,10 @@ function serviceTiles(service) {
          runtime.threads ? runtime.threads + ' threads' : ''),
     tile('Served', num(metrics.tokens_total), '',
          'tokens generated since start'),
+    service.uses_gpu && gpu.available
+      ? tile('Graphics', num(gpu.percent), '%',
+             (gpu.model || 'GPU') + ' · ' + (gpu.clock_mhz || '--') + ' MHz')
+      : null,
     tile('Uptime', duration(runtime.uptime), '',
          metrics.processing ? num(metrics.processing) + ' in flight' : 'idle'),
   ]);
@@ -547,7 +569,14 @@ function serviceTrendCard(service) {
         sparkline([{ values: history.cpu, color: 'var(--s2)', label: 'cpu' }],
           { step: 3, label: 'processor use by the model server' }),
       ]),
-    ]),
+      (history.gpu || []).some((v) => v !== null && v !== undefined)
+        ? h('div', {}, [
+            h('div', { class: 'card-title', style: 'margin-bottom:8px', text: 'Graphics' }),
+            sparkline([{ values: history.gpu, color: 'var(--s1)', label: 'gpu' }],
+              { step: 3, max: 100, label: 'graphics load while this server works' }),
+          ])
+        : null,
+    ].filter(Boolean)),
   ]);
 }
 
@@ -620,7 +649,7 @@ function renderService(data, service) {
     ]));
   }
 
-  stage.appendChild(isDns ? dnsTiles(service) : serviceTiles(service));
+  stage.appendChild(isDns ? dnsTiles(service) : serviceTiles(service, data.host));
   const trend = serviceTrendCard(service);
   if (trend) stage.appendChild(trend);
   stage.appendChild(h('div', { class: 'grid two' }, [

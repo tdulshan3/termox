@@ -152,8 +152,11 @@ same port the VM used to forward, so no client needed reconfiguring.
   call with `chat_template_kwargs: {"enable_thinking": true}`, whereas
   `--reasoning on` cannot be switched off by any request.
 - **llama.cpp resets its `/metrics` per-second gauges on scrape**, so anything
-  polling them frequently reads zero forever. Rates here are derived from the
-  monotonic counters instead.
+  polling them frequently reads zero forever. Worse, the underlying counters
+  only advance when a request *completes*, so a naive delta reads zero during
+  generation too. The rate shown is the tokens a finished request added divided
+  by the seconds it added — the true rate of that request — carried forward
+  while the next one runs.
 - **Docker inside an emulated guest is brutally slow** — `docker ps` costs 18
   seconds and `docker stats` 22, because the Go CLI has to start under TCG. The
   guest probe therefore never waits on Docker: it reads a cache file inside the
@@ -245,8 +248,8 @@ The host page ends with **Where things run** — every tracked app with the
 binary and working directory it was actually started from, read from `/proc`
 rather than inferred from the launch scripts.
 
-**A model server.** Throughput and processor trends, the runtime it actually
-got, and the endpoints to point a client at.
+**A model server.** Throughput, processor and graphics trends, the runtime it
+actually got, and the endpoints to point a client at.
 
 ![A model server](docs/img/service.png)
 

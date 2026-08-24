@@ -106,6 +106,7 @@ class Services:
 
     def __init__(self):
         self._cpu_prev = {}
+        self._counter_prev = {}
 
     def poll(self, interval):
         out = []
@@ -174,9 +175,15 @@ class Services:
             seconds = metrics.get("llamacpp:tokens_predicted_seconds_total", 0.0)
             prompt_tokens = metrics.get("llamacpp:prompt_tokens_total", 0.0)
             prompt_seconds = metrics.get("llamacpp:prompt_seconds_total", 0.0)
+            recent = self._recent_rates(spec["id"], predicted, seconds,
+                                        prompt_tokens, prompt_seconds)
             entry["metrics"] = {
-                "tokens_per_second": metrics.get("llamacpp:predicted_tokens_seconds"),
-                "prompt_per_second": metrics.get("llamacpp:prompt_tokens_seconds"),
+                # llama.cpp's own per-second gauges are reset when /metrics is
+                # scraped, so they read 0 almost always. These come from the
+                # monotonic counters instead: the tokens and the seconds that
+                # the last completed request added, divided.
+                "tokens_per_second": recent["tokens"],
+                "prompt_per_second": recent["prompt"],
                 "tokens_total": predicted,
                 "prompt_total": metrics.get("llamacpp:prompt_tokens_total"),
                 "prompt_cached": metrics.get("llamacpp:prompt_tokens_cached_total"),
@@ -219,6 +226,40 @@ class Services:
             "cores": _affinity(pid),
             "nice": _nice(pid),
         }
+
+
+    def _recent_rates(self, key, predicted, seconds, prompt_tokens, prompt_seconds):
+        """Throughput of whatever finished since the last poll.
+
+        llama.cpp only advances these counters when a request completes, so a
+        delta is exactly one or more finished requests: tokens added over
+        seconds added is their true rate. While a request is still running
+        nothing moves, and the previous figure is carried forward rather than
+        collapsing to zero.
+        """
+        prev = self._counter_prev.get(key)
+        self._counter_prev[key] = {
+            "predicted": predicted, "seconds": seconds,
+            "prompt_tokens": prompt_tokens, "prompt_seconds": prompt_seconds,
+            "tokens_rate": None, "prompt_rate": None,
+        }
+        if not prev:
+            return {"tokens": None, "prompt": None}
+
+        rates = {}
+        for name, now_tokens, now_secs, was_tokens, was_secs in (
+            ("tokens", predicted, seconds, prev["predicted"], prev["seconds"]),
+            ("prompt", prompt_tokens, prompt_seconds,
+             prev["prompt_tokens"], prev["prompt_seconds"]),
+        ):
+            dt, ds = now_tokens - was_tokens, now_secs - was_secs
+            if dt > 0 and ds > 0:
+                rates[name] = round(dt / ds, 2)
+            else:
+                rates[name] = prev.get(name + "_rate")     # nothing finished
+        self._counter_prev[key]["tokens_rate"] = rates["tokens"]
+        self._counter_prev[key]["prompt_rate"] = rates["prompt"]
+        return rates
 
 
 def _render_dns(entry, spec):

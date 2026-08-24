@@ -86,11 +86,16 @@ class State:
 
     def track_services(self, services):
         """Keep a short trend per service, on the service loop's clock."""
+        gpu = (self.host or {}).get("gpu") or {}
         for service in services:
             series = self.service_history.setdefault(
-                service["id"], {"cpu": [], "rate": []})
+                service["id"], {"cpu": [], "rate": [], "gpu": []})
+            series.setdefault("gpu", [])
             runtime = service.get("runtime") or {}
             metrics = service.get("metrics") or {}
+            # the GPU is a host-wide resource, but on a phone running one
+            # GPU-backed service its load is that service's load
+            series["gpu"].append(gpu.get("percent") if service.get("uses_gpu") else None)
             series["cpu"].append(runtime.get("cpu_percent"))
             # the per-second gauge only refreshes when a request finishes, so
             # a live request would otherwise read as a hole in the trend
