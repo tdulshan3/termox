@@ -35,7 +35,7 @@ a:hover { color: var(--color-accent-700); }
    opposite end of the neutral ramp in either theme. */
 [data-tx-poster] { color: var(--tx-on-accent); }
 [data-tx-poster] .btn { background: var(--tx-on-accent); color: var(--tx-on-accent-paper) !important; }
-[data-tx-poster] .btn:hover { background: #322e2c; }
+[data-tx-poster] .btn:hover { background: #ece5df; }
 [data-tx-poster] .btn-secondary { background: transparent; color: var(--tx-on-accent) !important; border-color: var(--tx-on-accent); }
 [data-tx-poster] .btn-secondary:hover { background: color-mix(in srgb, var(--tx-on-accent) 14%, transparent); }
 [data-tx-poster] .btn:focus-visible { outline: 2px solid var(--tx-on-accent); outline-offset: 2px; }
@@ -53,10 +53,11 @@ a:hover { color: var(--color-accent-700); }
   --color-accent-700: #a94d00;
   --color-accent-800: #7a3800;
   --color-accent-900: #4b2400;
-  /* Type and fills that sit ON the accent field. Orange needs ink, not paper,
-     so this one does not flip with the theme. */
-  --tx-on-accent: #1c1a19;
-  --tx-on-accent-paper: #fff6ee;
+  /* Type and fills that sit ON the accent field. White in either theme, so an
+     orange surface reads the same whichever ground is under it. The second
+     token is what sits on a chip filled with the first. */
+  --tx-on-accent: #ffffff;
+  --tx-on-accent-paper: #1c1a19;
   --tx-red: #c8372c;   --tx-red-ink: #92251c;   --tx-red-tint: #fbe7e5;
 }
 [data-tx-theme="dark"] {
@@ -74,8 +75,11 @@ a:hover { color: var(--color-accent-700); }
   --tx-red: #ef7d72;   --tx-red-ink: #f5aba3;   --tx-red-tint: #3a1512;
 }
 
-/* Primary actions: ink on orange reads at 8:1 where paper on orange reads at 2.6. */
+/* Anything filled with the accent carries the same white: primary actions and
+   the checked segment, which the system would otherwise paint in --color-bg
+   and so flip with the theme. */
 .btn-primary { color: var(--tx-on-accent) !important; }
+.seg-opt:has(input:checked) { color: var(--tx-on-accent); }
 .btn-primary:hover { background: var(--color-accent-600); }
 a { color: var(--color-accent-700); }
 [data-tx-theme="dark"] a { color: var(--color-accent-600); }
