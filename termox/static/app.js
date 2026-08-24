@@ -1,26 +1,32 @@
-/* termox dashboard ----------------------------------------------------
-   Polls /api/state and redraws. Charts are hand-built SVG: single-series
-   sparklines carry no legend (the card title names them), the two-series
-   network chart carries a legend plus end labels, and every plotted value
-   is also readable as text so nothing is gated behind a tooltip.        */
+/* termox — the Modernist panel from the Claude Design project, wired to the
+   real readings.
+
+   The design is a set of screens over one polled snapshot: Everything, the
+   host, each machine, each service, and the access screen. Markup here follows
+   the design's own structure and inline styling so the two stay comparable;
+   the system's classes (.btn, .tag, .table, .input, .seg) come from ds.css and
+   are never redefined.                                                        */
 
 'use strict';
 
 const POLL_MS = 2000;
 const TOKEN = new URLSearchParams(location.search).get('token');
 
-// A ?view= parameter wins over the remembered selection, so a page can be
-// linked to directly -- useful for sharing "look at this machine" and for
-// screenshotting a specific page.
 const state = {
   data: null,
-  selected: new URLSearchParams(location.search).get('view')
-    || sessionStorage.getItem('termox.selected')
-    || 'host',
+  view: new URLSearchParams(location.search).get('view')
+        || sessionStorage.getItem('termox.view') || 'overview',
+  window: sessionStorage.getItem('termox.window') || '90s',
+  /* ?theme= wins over the stored choice, so a link can carry the ground it
+     was meant to be read on. */
+  theme: new URLSearchParams(location.search).get('theme')
+         || localStorage.getItem('termox.theme') || 'dark',
   failures: 0,
+  chat: [],
+  draft: '',
+  sending: false,
+  logs: {},
 };
-
-const $ = (id) => document.getElementById(id);
 
 /* ------------------------------------------------------------ formatting */
 
@@ -34,10 +40,11 @@ function bytes(value, digits) {
   return n.toFixed(d) + ' ' + UNITS[i];
 }
 
-function rate(value) {
-  if (value === null || value === undefined) return '--';
-  if (value < 1024) return Math.round(value) + ' B/s';
-  return bytes(value, 1) + '/s';
+function num(value, digits) {
+  if (value === null || value === undefined || isNaN(value)) return '--';
+  const n = Number(value);
+  const d = digits === undefined ? 0 : digits;
+  return n >= 1000 && d === 0 ? n.toLocaleString('en-US') : n.toFixed(d);
 }
 
 function pct(value, digits) {
@@ -45,17 +52,10 @@ function pct(value, digits) {
   return Number(value).toFixed(digits === undefined ? 0 : digits) + '%';
 }
 
-/* A bare number for stat tiles, which carry their unit in a separate span. */
-function num(value, digits) {
-  if (value === null || value === undefined || isNaN(value)) return '--';
-  return Number(value).toFixed(digits === undefined ? 0 : digits);
-}
-
 function duration(seconds) {
   if (seconds === null || seconds === undefined || isNaN(seconds)) return '--';
   const s = Math.floor(seconds);
-  const d = Math.floor(s / 86400);
-  const h = Math.floor((s % 86400) / 3600);
+  const d = Math.floor(s / 86400), h = Math.floor((s % 86400) / 3600);
   const m = Math.floor((s % 3600) / 60);
   if (d) return d + 'd ' + h + 'h';
   if (h) return h + 'h ' + m + 'm';
@@ -65,250 +65,231 @@ function duration(seconds) {
 
 function ago(seconds) {
   if (seconds === null || seconds === undefined || seconds < 0) return 'never';
-  if (seconds < 60) return Math.round(seconds) + 's ago';
   return duration(seconds) + ' ago';
 }
 
-/* Meter fill severity. Status colour never travels alone -- every meter
-   prints its own value beside it, and pills carry a word as well. */
-function severity(percent, warn, serious, critical) {
-  if (percent === null || percent === undefined) return '';
-  if (percent >= (critical || 95)) return 'critical';
-  if (percent >= (serious || 85)) return 'serious';
-  if (percent >= (warn || 70)) return 'warning';
-  return '';
-}
-
-/* ------------------------------------------------------------------ dom */
+/* ------------------------------------------------------------------- dom */
 
 function h(tag, props, children) {
   const node = document.createElement(tag);
   if (props) {
     for (const key in props) {
-      if (key === 'class') node.className = props[key];
-      else if (key === 'text') node.textContent = props[key];
-      else if (key === 'html') node.innerHTML = props[key];
-      else if (key.startsWith('on')) node.addEventListener(key.slice(2), props[key]);
-      else if (props[key] !== null && props[key] !== undefined)
-        node.setAttribute(key, props[key]);
+      const value = props[key];
+      if (value === null || value === undefined || value === false) continue;
+      if (key === 'class') node.className = value;
+      else if (key === 'text') node.textContent = value;
+      else if (key === 'style') node.setAttribute('style', value);
+      else if (key.startsWith('on')) node.addEventListener(key.slice(2), value);
+      else node.setAttribute(key, value === true ? '' : value);
     }
   }
   (children || []).forEach((child) => {
     if (child === null || child === undefined || child === false) return;
-    node.appendChild(typeof child === 'string' ? document.createTextNode(child) : child);
+    node.appendChild(typeof child === 'string' || typeof child === 'number'
+      ? document.createTextNode(String(child)) : child);
   });
   return node;
 }
 
-function svg(tag, props) {
+function svg(tag, props, children) {
   const node = document.createElementNS('http://www.w3.org/2000/svg', tag);
-  for (const key in props) {
-    if (props[key] !== null && props[key] !== undefined) node.setAttribute(key, props[key]);
+  for (const key in props || {}) {
+    if (props[key] !== null && props[key] !== undefined) {
+      node.setAttribute(key, props[key]);
+    }
   }
+  (children || []).forEach((c) => c && node.appendChild(c));
   return node;
 }
 
-function card(title, note, children) {
-  const head = h('div', { class: 'card-head' }, [
-    h('div', { class: 'card-title', text: title }),
-    note ? (typeof note === 'string' ? h('div', { class: 'card-note', text: note }) : note) : null,
-  ]);
-  return h('section', { class: 'card' }, [head].concat(children || []));
-}
+const DIV = '2px solid var(--color-divider)';
 
-function rows(pairs) {
-  return h('dl', { class: 'rows' }, pairs.filter(Boolean).map(([label, value]) =>
-    h('div', { class: 'row' }, [
-      h('dt', { text: label }),
-      typeof value === 'string' || typeof value === 'number'
-        ? h('dd', { text: String(value) })
-        : h('dd', {}, [value]),
-    ])));
-}
+/* --------------------------------------------------------------- charts */
 
-function tile(label, value, unit, sub, lead) {
-  return h('div', { class: 'tile' + (lead ? ' lead' : '') }, [
-    h('div', { class: 'tile-label', text: label }),
-    h('div', { class: 'tile-value' }, [
-      String(value),
-      unit ? h('span', { class: 'unit', text: unit }) : null,
-    ]),
-    h('div', { class: 'tile-sub', text: sub || '' }),
-  ]);
-}
-
-function meter(label, value, percent, opts) {
+/* The design draws every reading the same way: a 1000x200 viewBox stretched
+   to the column, a mid rule and a top rule for scale, an ink area under a
+   hue-coloured line, and an optional dashed threshold. Stroke width is held
+   at 2px through the stretch with vector-effect. */
+function chart(values, opts) {
   const options = opts || {};
-  const level = options.severity === false ? '' : severity(percent, options.warn,
-    options.serious, options.critical);
-  const width = Math.max(0, Math.min(100, percent === null || percent === undefined ? 0 : percent));
-  const bar = h('div', { class: 'meter' }, [
-    h('i', { class: level, style: 'width:' + width.toFixed(1) + '%' }),
-  ]);
-  const row = h('div', { class: 'meter-row' }, [
-    h('div', { class: 'meter-label', text: label }),
-    h('div', { class: 'meter-value', text: value }),
-    bar,
-  ]);
-  if (options.tip) attachTip(row, options.tip);
-  return row;
-}
-
-function link(href, text, className) {
-  return h('a', { class: className || 'link', href: href,
-                  target: '_blank', rel: 'noreferrer', text: text });
-}
-
-function pill(text, level) {
-  return h('span', { class: 'pill ' + (level || '') }, [h('i'), text]);
-}
-
-/* -------------------------------------------------------------- tooltip */
-
-let tipNode = null;
-
-function showTip(html, x, y) {
-  if (!tipNode) {
-    tipNode = h('div', { class: 'tip' });
-    document.body.appendChild(tipNode);
-  }
-  tipNode.innerHTML = html;
-  tipNode.style.display = 'block';
-  const box = tipNode.getBoundingClientRect();
-  const left = Math.min(Math.max(8, x - box.width / 2), innerWidth - box.width - 8);
-  const top = y - box.height - 12 < 8 ? y + 16 : y - box.height - 12;
-  tipNode.style.left = left + 'px';
-  tipNode.style.top = top + 'px';
-}
-
-function hideTip() { if (tipNode) tipNode.style.display = 'none'; }
-
-function attachTip(node, html) {
-  node.addEventListener('pointerenter', (e) => showTip(html, e.clientX, e.clientY));
-  node.addEventListener('pointermove', (e) => showTip(html, e.clientX, e.clientY));
-  node.addEventListener('pointerleave', hideTip);
-}
-
-/* ------------------------------------------------------------ sparkline */
-
-const VIEW_W = 300;
-const VIEW_H = 64;
-
-/* series: [{values, color, label, format}] on ONE axis -- callers only ever
-   pass series that share a unit. */
-function sparkline(series, opts) {
-  const options = opts || {};
-  const clean = series.filter((s) => (s.values || []).some((v) => v !== null && v !== undefined));
-  const wrap = h('div', { class: 'spark-wrap' });
-  if (!clean.length) {
-    wrap.appendChild(h('div', { class: 'empty', text: 'no samples yet' }));
-    return wrap;
-  }
-
-  const count = Math.max.apply(null, clean.map((s) => s.values.length));
-  let max = options.max;
-  if (max === undefined) {
-    max = 0;
-    clean.forEach((s) => s.values.forEach((v) => { if (v > max) max = v; }));
-    max = max <= 0 ? 1 : max * 1.15;
-  }
-
-  const x = (i) => (count < 2 ? VIEW_W : (i / (count - 1)) * VIEW_W);
-  const y = (v) => VIEW_H - (Math.max(0, Math.min(max, v)) / max) * (VIEW_H - 4) - 2;
-
-  const chart = svg('svg', {
-    class: 'spark', viewBox: '0 0 ' + VIEW_W + ' ' + VIEW_H,
-    preserveAspectRatio: 'none', role: 'img',
-    'aria-label': options.label || 'trend',
-  });
-
-  [0.5, 1].forEach((frac) => {
-    chart.appendChild(svg('line', {
-      x1: 0, x2: VIEW_W, y1: y(max * frac), y2: y(max * frac),
-      stroke: 'var(--grid)', 'stroke-width': 1, 'vector-effect': 'non-scaling-stroke',
-    }));
-  });
-
-  clean.forEach((s) => {
-    const points = [];
-    s.values.forEach((v, i) => { if (v !== null && v !== undefined) points.push([x(i), y(v)]); });
-    if (!points.length) return;
-    const line = points.map((p, i) => (i ? 'L' : 'M') + p[0].toFixed(2) + ' ' + p[1].toFixed(2)).join(' ');
-
-    if (clean.length === 1) {
-      chart.appendChild(svg('path', {
-        d: line + ' L' + points[points.length - 1][0].toFixed(2) + ' ' + VIEW_H +
-           ' L' + points[0][0].toFixed(2) + ' ' + VIEW_H + ' Z',
-        fill: s.color, 'fill-opacity': 0.1, stroke: 'none',
-      }));
-    }
-    chart.appendChild(svg('path', {
-      d: line, fill: 'none', stroke: s.color, 'stroke-width': 2,
-      'stroke-linejoin': 'round', 'stroke-linecap': 'round',
-      'vector-effect': 'non-scaling-stroke',
-    }));
-    const last = points[points.length - 1];
-    chart.appendChild(svg('circle', {
-      cx: last[0], cy: last[1], r: 4, fill: s.color,
-      stroke: 'var(--surface)', 'stroke-width': 2,
-      'vector-effect': 'non-scaling-stroke',
-    }));
-  });
-
-  const cross = svg('line', {
-    y1: 0, y2: VIEW_H, stroke: 'var(--axis)', 'stroke-width': 1,
-    'vector-effect': 'non-scaling-stroke', opacity: 0,
-  });
-  chart.appendChild(cross);
-  wrap.appendChild(chart);
-
-  const fmt = options.format || ((v) => pct(v, 1));
-  chart.addEventListener('pointermove', (event) => {
-    const box = chart.getBoundingClientRect();
-    const frac = (event.clientX - box.left) / box.width;
-    const index = Math.max(0, Math.min(count - 1, Math.round(frac * (count - 1))));
-    cross.setAttribute('x1', x(index));
-    cross.setAttribute('x2', x(index));
-    cross.setAttribute('opacity', 1);
-    const when = (count - 1 - index) * (options.step || 1);
-    const lines = clean.map((s) => {
-      const v = s.values[index + (s.values.length - count)];
-      return '<span style="color:var(--ink-2)">' + s.label + '</span> <b>' +
-        (v === null || v === undefined ? '--' : fmt(v)) + '</b>';
+  const points = (values || []).slice();
+  const clean = points.filter((v) => v !== null && v !== undefined);
+  if (clean.length < 2) {
+    return h('div', {
+      class: 'text-muted',
+      style: 'height:148px;display:flex;align-items:center;justify-content:center;'
+           + 'border:1px dashed var(--color-divider);font-size:12px',
+      text: clean.length ? 'one sample so far' : 'nothing recorded for this window yet',
     });
-    lines.push('<span style="color:var(--muted)">' +
-      (when === 0 ? 'now' : Math.round(when) + 's ago') + '</span>');
-    showTip(lines.join('<br>'), event.clientX, box.top);
-  });
-  chart.addEventListener('pointerleave', () => { cross.setAttribute('opacity', 0); hideTip(); });
+  }
 
-  const foot = h('div', { class: 'spark-foot' });
-  if (clean.length > 1) {
-    foot.appendChild(h('div', { class: 'legend' }, clean.map((s) =>
-      h('span', {}, [
-        h('i', { style: 'background:' + s.color }),
-        s.label + ' ' + fmt(s.values[s.values.length - 1]),
-      ]))));
-  } else {
-    const values = clean[0].values.filter((v) => v !== null && v !== undefined);
-    foot.appendChild(h('div', { text: 'now ' + fmt(values[values.length - 1]) }));
-    foot.appendChild(h('div', {
-      text: 'peak ' + fmt(Math.max.apply(null, values)) +
-            '  ·  ' + Math.round(count * (options.step || 1)) + 's window',
+  const max = options.max !== undefined ? options.max
+    : Math.max.apply(null, clean) * 1.15 || 1;
+  const W = 1000, H = 200;
+  const x = (i) => (points.length < 2 ? W : (i / (points.length - 1)) * W);
+  const y = (v) => H - Math.max(0, Math.min(max, v)) / max * (H - 6) - 3;
+
+  /* Build one subpath per contiguous run of samples. Doing it in a single
+     path was drawing a wedge from the origin whenever a gap split the data,
+     because the close-to-baseline was applied once at the end rather than per
+     run. */
+  const runs = [];
+  let run = null;
+  points.forEach((v, i) => {
+    if (v === null || v === undefined) { run = null; return; }
+    if (!run) { run = []; runs.push(run); }
+    run.push([x(i), y(v)]);
+  });
+
+  const line = runs.map((r) =>
+    r.map((p, i) => (i ? 'L' : 'M') + p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join(' ')
+  ).join(' ');
+
+  const area = runs.filter((r) => r.length > 1).map((r) =>
+    r.map((p, i) => (i ? 'L' : 'M') + p[0].toFixed(1) + ' ' + p[1].toFixed(1)).join(' ')
+    + ' L' + r[r.length - 1][0].toFixed(1) + ' ' + H
+    + ' L' + r[0][0].toFixed(1) + ' ' + H + ' Z'
+  ).join(' ');
+
+  const kids = [
+    svg('line', { x1: 0, x2: W, y1: H / 2, y2: H / 2, stroke: 'var(--color-neutral-300)',
+                  'stroke-width': 1, 'vector-effect': 'non-scaling-stroke' }),
+    svg('line', { x1: 0, x2: W, y1: 3, y2: 3, stroke: 'var(--color-neutral-300)',
+                  'stroke-width': 1, 'vector-effect': 'non-scaling-stroke' }),
+  ];
+  if (options.threshold !== undefined && options.threshold !== null) {
+    kids.push(svg('line', {
+      x1: 0, x2: W, y1: y(options.threshold), y2: y(options.threshold),
+      stroke: 'var(--color-accent)', 'stroke-width': 1, 'stroke-dasharray': '6 5',
+      'vector-effect': 'non-scaling-stroke',
     }));
   }
-  wrap.appendChild(foot);
-  return wrap;
+  kids.push(svg('path', { class: 'tx-area', d: area }));
+  kids.push(svg('path', {
+    class: 'tx-line', d: line, fill: 'none', 'stroke-width': 2,
+    'stroke-linejoin': 'round', 'vector-effect': 'non-scaling-stroke',
+  }));
+
+  return svg('svg', {
+    viewBox: '0 0 ' + W + ' ' + H, preserveAspectRatio: 'none', role: 'img',
+    'aria-label': options.label || 'reading',
+    'data-tx-hue': options.hue || 'blue',
+    style: 'display:block;width:100%;height:148px',
+  }, kids);
+}
+
+function figure(title, readout, values, opts) {
+  const options = opts || {};
+  return h('figure', { style: 'margin:0;min-width:0' }, [
+    h('div', {
+      style: 'display:flex;align-items:baseline;justify-content:space-between;gap:12px;'
+           + 'border-bottom:' + DIV + ';padding-bottom:8px;margin-bottom:14px',
+    }, [
+      h('h6', { style: 'margin:0', text: title }),
+      h('span', { style: 'font-size:12px;font-variant-numeric:tabular-nums' }, [readout]),
+    ]),
+    chart(values, options),
+    h('div', {
+      style: 'display:flex;justify-content:space-between;gap:12px;font-size:11px;'
+           + 'margin-top:8px;border-top:1px solid var(--color-divider);padding-top:6px',
+    }, [
+      h('span', { class: 'text-muted', text: state.window + ' ago' }),
+      options.note ? h('span', { class: 'text-muted', style: 'text-align:center', text: options.note }) : null,
+      h('span', { class: 'text-muted', text: 'now' }),
+    ]),
+  ]);
+}
+
+function readout(now, rest) {
+  return h('span', {}, [now, ' ', h('span', { class: 'text-muted', text: rest })]);
+}
+
+/* ---------------------------------------------------------------- pieces */
+
+function stat(label, value, unit, sub, hue) {
+  return h('div', {
+    style: 'background:var(--color-bg);padding:13px 18px 18px;border-top:3px solid '
+         + (hue ? 'var(--tx-' + hue + ')' : 'var(--color-neutral-400)'),
+  }, [
+    h('h6', { style: 'margin:0 0 6px' + (hue ? ';color:var(--tx-' + hue + '-ink)' : ''), text: label }),
+    h('div', {
+      style: 'font-family:var(--font-heading);font-weight:800;font-size:40px;'
+           + 'line-height:1;letter-spacing:-.02em',
+    }, [value, unit ? h('span', { style: 'font-size:17px', text: unit }) : null]),
+    h('div', { class: 'text-muted', style: 'font-size:11.5px;margin-top:4px', text: sub || '' }),
+  ]);
+}
+
+function tile(label, value, unit, sub) {
+  return h('div', { style: 'background:var(--color-bg);padding:16px 18px 18px' }, [
+    h('h6', { style: 'margin:0 0 6px', text: label }),
+    h('div', {
+      style: 'font-family:var(--font-heading);font-weight:800;font-size:32px;'
+           + 'line-height:1;letter-spacing:-.02em',
+    }, [value, unit ? h('span', { style: 'font-size:17px', text: unit }) : null]),
+    h('div', { class: 'text-muted', style: 'font-size:11.5px;margin-top:4px', text: sub || '' }),
+  ]);
+}
+
+function dl(pairs) {
+  const kids = [];
+  pairs.filter(Boolean).forEach(([term, value]) => {
+    kids.push(h('dt', {
+      class: 'text-muted',
+      style: 'font-size:12px;padding:7px 0;border-bottom:1px solid var(--color-divider)',
+      text: term,
+    }));
+    kids.push(h('dd', {
+      style: 'margin:0;font-size:13px;text-align:right;padding:7px 0;'
+           + 'border-bottom:1px solid var(--color-divider);min-width:0;overflow-wrap:anywhere',
+    }, [typeof value === 'string' ? value : value]));
+  });
+  return h('dl', {
+    style: 'margin:0;display:grid;grid-template-columns:auto minmax(0,1fr);'
+         + 'align-items:baseline;column-gap:16px',
+  }, kids);
+}
+
+function bar(percent, hue) {
+  const width = Math.max(0, Math.min(100, percent || 0));
+  return h('div', { style: 'height:8px;background:var(--color-neutral-300)' }, [
+    h('i', {
+      style: 'display:block;height:100%;width:' + width.toFixed(1) + '%;background:'
+           + (hue === 'accent' ? 'var(--color-accent)'
+              : hue ? 'var(--tx-' + hue + ')' : 'var(--color-text)'),
+    }),
+  ]);
+}
+
+function sectionHead(title, note, right) {
+  return h('div', {
+    style: 'display:flex;align-items:baseline;gap:16px;flex-wrap:wrap;margin-bottom:16px',
+  }, [
+    h('h3', { style: 'margin:0', text: title }),
+    note ? h('span', { class: 'text-muted', style: 'font-size:12px;flex:1;min-width:200px', text: note }) : null,
+    right || null,
+  ]);
+}
+
+function stateTag(label, kind) {
+  const hue = kind === 'up' ? 'green' : kind === 'busy' ? null : 'red';
+  return h('span', {
+    class: 'tag tag-outline', 'data-tx-hue': hue || undefined,
+    style: hue ? 'gap:6px' : 'gap:6px;border-color:var(--color-accent);color:var(--color-accent)',
+  }, [
+    kind === 'busy' ? h('span', { class: 'tx-spin' }) : null,
+    label,
+  ]);
 }
 
 /* -------------------------------------------------------------- control */
 
-const pending = new Set();      // targets with a request in flight locally
+const pendingTargets = new Set();
 
 async function act(target, action, label) {
-  if (pending.has(target)) return;
-  pending.add(target);
-  toast('working', label, action + 'ing');
+  if (pendingTargets.has(target)) return;
+  pendingTargets.add(target);
+  toast('work', label, action + 'ing');
   render();
   try {
     const response = await fetch('/api/control', {
@@ -319,896 +300,1327 @@ async function act(target, action, label) {
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || 'refused');
-    if (data.note) toast('working', label, data.note);
+    if (data.note) toast('work', label, data.note);
   } catch (err) {
-    toast('critical', label, err.message);
+    toast('bad', label, err.message);
   } finally {
-    pending.delete(target);
+    pendingTargets.delete(target);
     poll();
   }
 }
 
-/* A thing is in transition when we asked for it, or when the sampler can see
-   the process but it is not answering yet -- which also covers something
-   started from a terminal rather than from here. Offering "Start" during that
-   window is the wrong answer to the wrong question. */
-function transitional(state) {
-  return state === 'starting' || state === 'stopping';
-}
+function transitional(s) { return s === 'starting' || s === 'stopping'; }
 
-function actionBar(target, state, job, label) {
-  const busy = !!job || pending.has(target) || transitional(state);
+function actions(target, itemState, job, label, size) {
+  const busy = !!job || pendingTargets.has(target) || transitional(itemState);
+  const small = size === 'small'
+    ? 'font-size:11px;padding:3px 9px;justify-content:flex-start'
+    : 'justify-content:flex-start';
 
   if (busy) {
-    return h('div', { class: 'actions' }, [
-      h('button', { class: 'action', type: 'button', disabled: true }, [
-        h('span', { class: 'dot-spin' }),
-        state === 'stopping' ? 'Stopping' : 'Starting',
-      ]),
-    ]);
+    return [h('button', { type: 'button', class: 'btn btn-secondary', disabled: true, style: small }, [
+      h('span', { class: 'tx-spin' }),
+      itemState === 'stopping' ? 'Stopping' : 'Starting',
+    ])];
   }
-
-  if (state !== 'running') {
-    return h('div', { class: 'actions' }, [
-      h('button', {
-        class: 'action primary', type: 'button',
-        onclick: () => act(target, 'start', label),
-      }, ['Start']),
-    ]);
+  if (itemState !== 'running') {
+    return [h('button', {
+      type: 'button', class: 'btn btn-primary', style: small,
+      onclick: (e) => { e.stopPropagation(); act(target, 'start', label); },
+    }, ['Start'])];
   }
-
-  return h('div', { class: 'actions' }, [
+  return [
     h('button', {
-      class: 'action', type: 'button',
-      onclick: () => act(target, 'restart', label),
+      type: 'button', class: 'btn btn-secondary', style: small,
+      onclick: (e) => { e.stopPropagation(); act(target, 'restart', label); },
     }, ['Restart']),
     h('button', {
-      class: 'action danger', type: 'button',
-      onclick: () => act(target, 'stop', label),
+      type: 'button', class: 'btn btn-secondary', style: small,
+      onclick: (e) => { e.stopPropagation(); act(target, 'stop', label); },
     }, ['Stop']),
-  ]);
+  ];
 }
 
-function activityStrip(job, state) {
-  if (!job && !transitional(state)) return null;
+function activity(job, itemState) {
+  if (!job && !transitional(itemState)) return null;
   const phase = job && job.phase;
   const verb = job
     ? (phase === 'stopping' ? 'Stopping'
-       : phase === 'starting' ? (job.action === 'restart' ? 'Restarting' : 'Starting')
-       : 'Working')
-    : (state === 'stopping' ? 'Stopping' : 'Starting');
-  const detail = job ? job.message
-    : 'the process is up but not answering on its port yet';
-  return h('div', { class: 'activity' }, [
-    h('span', { class: 'pulse-ring' }),
-    h('span', { text: verb }),
-    h('span', { class: 'what', text: detail }),
+       : job.action === 'restart' ? 'Restarting' : 'Starting')
+    : (itemState === 'stopping' ? 'Stopping' : 'Starting');
+  const detail = job ? job.message : 'up but not answering on its port yet';
+  return h('div', {
+    style: 'display:flex;align-items:center;gap:10px;padding:12px 24px;'
+         + 'background:var(--color-accent-100);border-bottom:' + DIV,
+  }, [
+    h('span', { 'data-tx-dot': 'busy', style: 'flex:none' }),
+    h('span', { style: 'font-family:var(--font-heading);font-weight:800;font-size:14px', text: verb }),
+    h('span', { class: 'text-muted', style: 'font-size:13px', text: detail }),
   ]);
 }
 
-/* ---------------------------------------------------------------- toasts */
+/* --------------------------------------------------------------- toasts */
 
-const toastBox = h('div', { class: 'toasts' });
-document.body.appendChild(toastBox);
+const toastBox = h('div', { class: 'tx-toasts' });
 const seenJobs = new Map();
 
 function toast(level, title, detail, ttl) {
-  const node = h('div', { class: 'toast ' + level }, [
+  const node = h('div', { class: 'tx-toast ' + level }, [
     h('i'),
-    h('div', { class: 'body' }, [
-      h('div', { class: 'title', text: title }),
-      detail ? h('div', { class: 'detail', text: detail }) : null,
-    ].filter(Boolean)),
+    h('div', { style: 'min-width:0' }, [
+      h('div', { style: 'font-family:var(--font-heading);font-weight:800', text: title }),
+      detail ? h('div', { class: 'text-muted', style: 'margin-top:2px', text: detail }) : null,
+    ]),
   ]);
   toastBox.appendChild(node);
-  setTimeout(() => node.remove(), ttl || (level === 'working' ? 4000 : 7000));
+  setTimeout(() => node.remove(), ttl || (level === 'work' ? 4000 : 7000));
 }
 
-/* Announce jobs that finished while we were watching, once each. */
 function announceJobs(jobs) {
   (jobs || []).forEach((job) => {
     const was = seenJobs.get(job.id);
     seenJobs.set(job.id, job.state);
     if (was && was !== job.state && job.state !== 'running') {
-      toast(job.state === 'done' ? 'good' : 'critical', job.label, job.message);
+      toast(job.state === 'done' ? 'good' : 'bad', job.label, job.message);
     }
   });
 }
 
-/* ---------------------------------------------------------------- views */
+/* ------------------------------------------------------------ navigation */
 
-function hostTiles(host, nodes) {
-  const cpu = host.cpu || {};
-  const mem = host.memory || {};
-  const battery = host.battery || {};
-  const hottest = (host.thermals || [])[0];
-  const running = nodes.filter((n) => n.state === 'running').length;
-
-  const tiles = [
-    tile('Processor', num(cpu.total), '%',
-         (cpu.count || 0) + ' cores · ' + (cpu.governor || 'unknown governor'), true),
-    tile('Memory', num(mem.percent), '%',
-         bytes(mem.used) + ' of ' + bytes(mem.total)),
-    tile('Machines', running + ' / ' + nodes.length, '',
-         nodes.length === 1 ? '1 registered' : nodes.length + ' registered'),
-  ];
-  if (hottest) {
-    tiles.push(tile('Hottest zone', hottest.celsius.toFixed(1), '°C', hottest.zone));
-  }
-  if (battery.available) {
-    tiles.push(tile('Battery', battery.percentage === null ? '--' : battery.percentage, '%',
-      [battery.status, battery.celsius ? battery.celsius.toFixed(1) + ' °C' : null]
-        .filter(Boolean).join(' · ')));
-  }
-  tiles.push(tile('Uptime', duration(host.uptime), '',
-    host.load ? 'load ' + host.load.one.toFixed(2) : ''));
-  return h('div', { class: 'tiles' }, tiles);
+function go(view) {
+  state.view = view;
+  sessionStorage.setItem('termox.view', view);
+  const url = new URL(location.href);
+  if (view === 'overview') url.searchParams.delete('view');
+  else url.searchParams.set('view', view);
+  history.replaceState(null, '', url);
+  render();
+  const main = document.querySelector('main');
+  if (main) { main.focus(); window.scrollTo(0, 0); }
 }
 
-function cpuCard(host, history) {
+function setWindow(label) {
+  state.window = label;
+  sessionStorage.setItem('termox.window', label);
+  render();
+}
+
+function readingFor(name) {
+  const all = (state.data && state.data.readings) || {};
+  return (all[name] || {})[state.window] || [];
+}
+
+function serviceReading(id, kind) {
+  const all = (state.data && state.data.serviceReadings) || {};
+  return (all[id + '.' + kind] || {})[state.window] || [];
+}
+
+function latest(values) {
+  for (let i = values.length - 1; i >= 0; i -= 1) {
+    if (values[i] !== null && values[i] !== undefined) return values[i];
+  }
+  return null;
+}
+
+function peak(values) {
+  const clean = values.filter((v) => v !== null && v !== undefined);
+  return clean.length ? Math.max.apply(null, clean) : null;
+}
+
+/* ---------------------------------------------------------------- header */
+
+function header(data) {
+  const host = data.host || {};
+  const id = host.identity || {};
+  const nodes = data.nodes || [];
+  const services = data.services || [];
+  const up = (list) => list.filter((x) => x.state === 'running').length;
+  const control = data.control || {};
+
+  const chip = h('span', {
+    style: 'width:30px;height:30px;flex:none;display:grid;place-items:center;background:#1c1a19',
+  }, [
+    h('span', {
+      style: 'font-family:var(--font-heading);font-weight:800;font-size:18px;color:#f87800',
+      text: 't',
+    }),
+  ]);
+
+  return h('header', {
+    'data-tx-head': 'true',
+    style: 'display:flex;align-items:center;gap:24px;padding:12px 24px;border-bottom:' + DIV
+         + ';background:var(--color-bg);position:sticky;top:0;z-index:30;flex-wrap:wrap',
+  }, [
+    h('div', { style: 'display:flex;align-items:center;gap:10px' }, [
+      chip,
+      h('span', {
+        style: 'font-family:var(--font-heading);font-weight:800;font-size:18px;letter-spacing:-.015em',
+        text: 'termox',
+      }),
+    ]),
+    h('div', { style: 'display:flex;gap:20px;font-size:12px;flex-wrap:wrap;min-width:0' }, [
+      h('span', {}, [h('span', { class: 'text-muted', text: 'host ' }), id.address || '--']),
+      h('span', {}, [h('span', { class: 'text-muted', text: 'up ' }), duration(host.uptime)]),
+      h('span', {}, [h('span', { class: 'text-muted', text: 'machines ' }),
+                     up(nodes) + ' / ' + nodes.length]),
+      h('span', {}, [h('span', { class: 'text-muted', text: 'services ' }),
+                     up(services) + ' / ' + services.length]),
+    ]),
+    h('div', { style: 'margin-left:auto;display:flex;align-items:center;gap:12px' }, [
+      h('span', {
+        class: 'tag tag-outline tx-live', 'data-tx-hue': state.failures ? 'red' : 'green',
+        style: 'gap:6px',
+      }, [
+        h('i', {
+          style: 'width:6px;height:6px;background:var(--tx-'
+               + (state.failures ? 'red' : 'green') + ');animation:tx-beat 2.4s ease-in-out infinite',
+        }),
+        state.failures ? 'RETRYING' : 'LIVE · 2s',
+      ]),
+      h('button', {
+        type: 'button', class: 'btn btn-secondary', style: 'justify-content:flex-start',
+        onclick: () => go('access'),
+      }, [control.token_required ? 'Token required' : 'Unauthenticated']),
+      h('button', {
+        type: 'button', class: 'btn btn-secondary', style: 'justify-content:flex-start',
+        'aria-pressed': state.theme === 'dark' ? 'true' : 'false',
+        onclick: toggleTheme,
+      }, [state.theme === 'dark' ? 'Light' : 'Dark']),
+    ]),
+  ]);
+}
+
+function toggleTheme() {
+  state.theme = state.theme === 'dark' ? 'light' : 'dark';
+  localStorage.setItem('termox.theme', state.theme);
+  render();
+}
+
+/* ------------------------------------------------------------------ rail */
+
+function railEntry(opts) {
+  const on = state.view === opts.view;
+  return h('div', {
+    'data-tx-entry': 'true', 'data-tx-on': on ? 'true' : 'false',
+  }, [
+    h('button', {
+      type: 'button',
+      style: 'display:block;width:100%;text-align:left;padding:12px 16px'
+           + (opts.actions ? ' 6px' : '') + ';background:transparent;border:0;'
+           + 'cursor:pointer;font:inherit;color:inherit',
+      onclick: () => go(opts.view),
+    }, [
+      h('span', { style: 'display:flex;align-items:baseline;gap:8px' }, [
+        opts.dot ? h('span', { 'data-tx-dot': opts.dot, style: 'flex:none' }) : null,
+        h('span', {
+          style: 'font-family:var(--font-heading);font-weight:800;font-size:15px;flex:1;min-width:0',
+          text: opts.name,
+        }),
+        opts.metric ? h('span', {
+          style: 'font-size:13px;font-variant-numeric:tabular-nums', text: opts.metric,
+        }) : null,
+      ]),
+      h('span', {
+        class: 'text-muted',
+        style: 'display:block;font-size:11.5px;padding-left:' + (opts.dot ? '16px' : '0'),
+        text: opts.sub,
+      }),
+    ]),
+    opts.actions ? h('div', { style: 'display:flex;gap:6px;padding:0 16px 12px' }, opts.actions) : null,
+  ]);
+}
+
+function rail(data) {
+  const host = data.host || {};
+  const id = host.identity || {};
+  const battery = host.battery || {};
+  const hottest = (host.thermals || [])[0];
+  const nodes = data.nodes || [];
+  const services = data.services || [];
+  const kids = [];
+
+  kids.push(h('div', { 'data-tx-entry': 'true', 'data-tx-on': state.view === 'overview' ? 'true' : 'false' }, [
+    h('button', {
+      type: 'button',
+      style: 'display:block;width:100%;text-align:left;padding:15px 16px;background:transparent;'
+           + 'border:0;cursor:pointer;font:inherit;color:inherit',
+      onclick: () => go('overview'),
+    }, [
+      h('span', { style: 'display:block;font-family:var(--font-heading);font-weight:800;font-size:16px', text: 'Everything' }),
+      h('span', { class: 'text-muted', style: 'display:block;font-size:11.5px', text: 'the whole stack on one page' }),
+    ]),
+  ]));
+
+  kids.push(h('div', { 'data-tx-group': 'true' }, [
+    h('span', { text: 'Host' }), h('span', { 'data-tx-count': 'true', text: '1' }),
+  ]));
+  kids.push(railEntry({
+    view: 'host', dot: 'live', name: id.device || id.hostname || 'this phone',
+    metric: pct((host.cpu || {}).total),
+    sub: [pct((host.memory || {}).percent) + ' memory',
+          battery.available ? battery.percentage + '% battery' : null,
+          hottest ? hottest.celsius.toFixed(1) + ' °C' : null].filter(Boolean).join(' · '),
+  }));
+
+  const upNodes = nodes.filter((n) => n.state === 'running').length;
+  kids.push(h('div', { 'data-tx-group': 'true' }, [
+    h('span', { text: 'Machines' }),
+    h('span', { 'data-tx-count': 'true', text: upNodes + ' of ' + nodes.length + ' up' }),
+  ]));
+  nodes.forEach((node) => {
+    const runtime = node.runtime || {};
+    const spec = node.spec || {};
+    kids.push(railEntry({
+      view: 'node:' + node.key, name: node.name,
+      dot: transitional(node.state) ? 'busy' : node.state === 'running' ? 'up' : 'down',
+      metric: node.state === 'running' ? pct(runtime.cpu_percent) : null,
+      sub: node.state === 'running'
+        ? [(spec.cores || '?') + ' cores', bytes((spec.memory_mb || 0) * 1024 * 1024)].join(' · ')
+        : ['stopped', (spec.cores || '?') + ' cores',
+           bytes((spec.memory_mb || 0) * 1024 * 1024)].join(' · '),
+      actions: actions(node.key, node.state, node.job, node.name, 'small'),
+    }));
+  });
+
+  const upServices = services.filter((s) => s.state === 'running').length;
+  kids.push(h('div', { 'data-tx-group': 'true' }, [
+    h('span', { text: 'Services' }),
+    h('span', { 'data-tx-count': 'true', text: upServices + ' of ' + services.length + ' up' }),
+  ]));
+  services.forEach((service) => {
+    const runtime = service.runtime || {};
+    const metrics = service.metrics || {};
+    let sub;
+    if (service.state !== 'running') {
+      sub = service.state;
+    } else if (service.id === 'dns') {
+      sub = [(service.dns_open ? 'resolving on ' + service.dns_port : 'port closed'),
+             bytes(runtime.rss)].join(' · ');
+    } else {
+      const rate = metrics.tokens_per_second || metrics.average_tps;
+      sub = [rate ? num(rate, 1) + ' tok/s' : 'no requests yet',
+             bytes(runtime.rss)].filter(Boolean).join(' · ');
+    }
+    kids.push(railEntry({
+      view: 'svc:' + service.id, name: service.name,
+      dot: transitional(service.state) ? 'busy' : service.state === 'running' ? 'up' : 'down',
+      metric: service.state === 'running' ? pct(runtime.cpu_percent) : null,
+      sub: sub,
+      actions: actions('svc:' + service.id, service.state, service.job, service.name, 'small'),
+    }));
+  });
+
+  kids.push(h('div', { style: 'border-top:' + DIV }));
+
+  return h('nav', {
+    'aria-label': 'Machines and services', 'data-tx-rail': 'true',
+    style: 'border-right:' + DIV + ';position:sticky;top:59px;align-self:start',
+  }, kids);
+}
+
+/* -------------------------------------------------------------- overview */
+
+function poster(data) {
+  const alerts = data.alerts || [];
+  if (!alerts.length) {
+    return h('div', {
+      'data-tx-poster': 'true',
+      style: 'background:var(--color-accent);padding:20px 24px',
+    }, [
+      h('div', { style: 'display:flex;align-items:baseline;gap:16px;flex-wrap:wrap' }, [
+        h('span', {
+          style: 'font-family:var(--font-heading);font-weight:800;font-size:25px;line-height:1.12',
+          text: 'Nothing wants you',
+        }),
+        h('span', { style: 'font-size:12px;opacity:.85',
+                    text: 'every service up, nothing over its threshold' }),
+      ]),
+    ]);
+  }
+  return h('div', {
+    'data-tx-poster': 'true', style: 'background:var(--color-accent);padding:20px 24px',
+  }, [
+    h('div', { style: 'display:flex;align-items:baseline;gap:16px;flex-wrap:wrap' }, [
+      h('span', {
+        style: 'font-family:var(--font-heading);font-weight:800;font-size:25px;line-height:1.12',
+        text: alerts.length + (alerts.length === 1 ? ' thing wants you' : ' things want you'),
+      }),
+      h('span', { style: 'font-size:12px;opacity:.85',
+                  text: 'derived from what was just sampled' }),
+      h('span', { style: 'margin-left:auto;display:flex;gap:8px' }, [
+        h('button', {
+          type: 'button', class: 'btn btn-secondary', style: 'justify-content:flex-start',
+          onclick: () => go('host'),
+        }, ['Look at the host']),
+      ]),
+    ]),
+    h('div', {
+      style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:2px;'
+           + 'margin-top:16px;background:color-mix(in srgb,var(--tx-on-accent) 28%,transparent)',
+    }, alerts.slice(0, 4).map((alert) => h('div', {
+      style: 'background:var(--color-accent);padding:12px 14px',
+    }, [
+      h('div', { style: 'font-family:var(--font-heading);font-weight:800;font-size:15px', text: alert.title }),
+      h('div', { style: 'font-size:12px;opacity:.9', text: alert.detail }),
+    ]))),
+  ]);
+}
+
+function windowPicker() {
+  return h('div', { style: 'display:flex;align-items:center;gap:12px' }, [
+    h('span', { class: 'text-muted',
+                style: 'font-size:11px;letter-spacing:.08em;text-transform:uppercase', text: 'Window' }),
+    h('div', { class: 'seg' }, ['90s', '15m', '1h', '24h'].map((label) =>
+      h('label', { class: 'seg-opt' }, [
+        h('input', {
+          type: 'radio', name: 'tx-range', checked: state.window === label,
+          onchange: () => setWindow(label),
+        }),
+        label,
+      ]))),
+  ]);
+}
+
+function renderOverview(data) {
+  const host = data.host || {};
   const cpu = host.cpu || {};
+  const memory = host.memory || {};
+  const gpu = host.gpu || {};
+  const battery = host.battery || {};
+  const hottest = (host.thermals || [])[0];
+  const storage = (host.storage || [])[0];
+  const nodes = data.nodes || [];
+  const services = data.services || [];
+  const best = services.map((s) => (s.metrics || {}).tokens_per_second
+                                || (s.metrics || {}).average_tps || 0);
+  const fastest = Math.max.apply(null, best.concat([0]));
+  const out = [poster(data)];
+
+  out.push(h('div', {
+    'data-tx-pad': 'true',
+    style: 'display:flex;align-items:flex-end;justify-content:space-between;gap:24px;'
+         + 'flex-wrap:wrap;padding:24px 24px 16px;border-bottom:' + DIV,
+  }, [
+    h('div', {}, [
+      h('h1', { style: 'margin:0;font-size:42px', text: 'Everything' }),
+      h('div', { class: 'text-muted', style: 'font-size:13px',
+                 text: 'One phone. ' + nodes.length + (nodes.length === 1 ? ' machine. ' : ' machines. ')
+                     + services.length + ' services. Read every two seconds.' }),
+    ]),
+    windowPicker(),
+  ]));
+
+  out.push(h('div', {
+    'data-tx-strip': 'true',
+    style: 'display:grid;grid-template-columns:minmax(0,1fr);border-bottom:' + DIV,
+  }, [
+    h('div', {
+      style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:2px;'
+           + 'background:var(--color-divider)',
+    }, [
+      stat('Processor', num(cpu.total), '%',
+           (cpu.count || 0) + ' cores · ' + (cpu.governor || 'unknown'), 'blue'),
+      stat('Memory', num(memory.percent), '%',
+           bytes(memory.used) + ' of ' + bytes(memory.total), 'violet'),
+      hottest ? stat('Hottest zone', hottest.celsius.toFixed(1), '°C', hottest.zone, 'red') : null,
+      battery.available
+        ? stat('Battery', num(battery.percentage), '%',
+               [(battery.status || '').toLowerCase().replace(/_/g, ' '),
+                battery.celsius ? battery.celsius.toFixed(1) + ' °C' : null]
+                 .filter(Boolean).join(' · '), 'green')
+        : null,
+      stat('Generating', fastest ? num(fastest, 1) : '--', fastest ? ' tok/s' : '',
+           fastest ? 'fastest model server' : 'no requests yet', 'teal'),
+      storage ? stat('Storage', bytes(storage.free).split(' ')[0],
+                     ' ' + bytes(storage.free).split(' ')[1],
+                     'free of ' + bytes(storage.total)) : null,
+    ].filter(Boolean)),
+  ]));
+
+  const cpuValues = readingFor('cpu');
+  const memValues = readingFor('memory');
+  const gpuValues = readingFor('gpu');
+  const tempValues = readingFor('temp');
+
+  out.push(h('section', { style: 'padding:24px;border-bottom:' + DIV }, [
+    h('div', {
+      'data-tx-charts': 'true',
+      style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:32px',
+    }, [
+      figure('Processor load',
+             readout(pct(latest(cpuValues), 1), 'now · ' + pct(peak(cpuValues), 1) + ' peak'),
+             cpuValues, { hue: 'blue', max: 100, threshold: 85,
+                          label: 'processor load', note: 'alert above 85%' }),
+      figure('Memory in use',
+             readout(pct(latest(memValues), 1), 'now · ' + pct(peak(memValues), 1) + ' peak'),
+             memValues, { hue: 'violet', max: 100, threshold: 90,
+                          label: 'memory in use', note: bytes(memory.available) + ' free' }),
+      gpu.available
+        ? figure('Graphics · ' + (gpu.model || 'GPU'),
+                 readout(pct(latest(gpuValues), 1), 'now · ' + pct(peak(gpuValues), 1) + ' peak'),
+                 gpuValues, { hue: 'teal', max: 100, label: 'graphics load',
+                              note: 'clock held at ' + (gpu.clock_mhz || '--') + ' of '
+                                  + (gpu.max_clock_mhz || '--') + ' MHz' })
+        : null,
+      (host.thermals || []).length
+        ? figure('Hottest thermal zone',
+                 readout(num(latest(tempValues), 1) + ' °C',
+                         'now · ' + (host.thermals || []).length + ' zones'),
+                 tempValues, { hue: 'red', label: 'hottest thermal zone',
+                               note: 'the driver throttles hard above 55' })
+        : null,
+    ].filter(Boolean)),
+  ]));
+
+  out.push(h('section', { style: 'border-bottom:' + DIV }, [
+    h('div', { style: 'padding:20px 24px 14px;display:flex;align-items:baseline;gap:16px;flex-wrap:wrap' }, [
+      h('h3', { style: 'margin:0', text: 'Machines and services' }),
+      h('span', { class: 'text-muted', style: 'font-size:12px',
+                  text: 'Every control is one click. Nothing here is behind a menu.' }),
+    ]),
+    h('div', {
+      style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:2px;'
+           + 'background:var(--color-divider);border-top:' + DIV,
+    }, nodes.map(nodeCard).concat(services.map(serviceCard))),
+  ]));
+
+  out.push(wiringSection(data));
+  out.push(pathsSection(data));
+  return out;
+}
+
+/* The architecture, drawn from what is actually configured rather than from a
+   diagram that can drift: the ports come from the services, the guest row only
+   appears when a machine forwards ssh. */
+function wiringSection(data) {
+  const host = data.host || {};
+  const gpu = host.gpu || {};
+  const rows = [];
+  rows.push(['/proc + /sys', 'the phone'
+    + (gpu.available ? ', incl. ' + (gpu.model || 'the GPU') : '')]);
+  if ((data.nodes || []).length) rows.push(['/proc/<pid>', 'each qemu process']);
+  (data.services || []).forEach((service) => {
+    const port = (service.endpoint || '').split(':').pop();
+    rows.push([':' + port + (service.id === 'dns' ? ' /control' : ' /metrics'), service.name]);
+  });
+  const sshPort = ((data.nodes || [])[0] || {}).ports &&
+    ((data.nodes || [])[0].ports.find((p) => p.guest_port === 22) || {}).host_port;
+  if (sshPort) rows.push(['ssh 127.0.0.1:' + sshPort, 'inside each guest']);
+
+  return h('section', { style: 'padding:24px;border-bottom:' + DIV }, [
+    sectionHead('What talks to what',
+                'Stdlib only on both ends. Nothing installed inside the guests.'),
+    h('div', { style: 'display:flex;flex-direction:column;gap:2px;background:var(--color-divider)' }, [
+      h('div', { style: 'background:var(--color-bg);padding:12px 14px' }, [
+        h('div', { style: 'font-family:var(--font-heading);font-weight:800;font-size:15px', text: 'browser' }),
+        h('div', { class: 'text-muted', style: 'font-size:11.5px', text: 'anywhere on the LAN' }),
+      ]),
+      h('div', { style: 'background:var(--color-bg);padding:12px 14px' }, [
+        h('div', { style: 'font-family:var(--font-heading);font-weight:800;font-size:15px',
+                   text: (((host.identity || {}).address) || 'phone') + ':8080' }),
+        h('div', { style: 'font-size:13px', text: 'termox' }),
+        h('div', { class: 'text-muted', style: 'font-size:11.5px', text: 'Termux, native, stdlib only' }),
+      ]),
+      h('div', { style: 'background:var(--color-bg);padding:12px 14px 14px 34px' }, [
+        dl(rows.map(([k, v]) => [k, v])),
+      ]),
+    ]),
+  ]);
+}
+
+function nodeCard(node) {
+  const runtime = node.runtime || {};
+  const spec = node.spec || {};
+  const running = node.state === 'running';
+  return h('article', {
+    style: 'background:var(--color-bg);padding:18px 20px 20px;display:flex;'
+         + 'flex-direction:column;gap:14px;min-width:0',
+  }, [
+    h('div', { style: 'display:flex;align-items:baseline;gap:10px;flex-wrap:wrap' }, [
+      h('button', {
+        type: 'button',
+        style: 'background:transparent;border:0;padding:0;cursor:pointer;font:inherit;color:inherit;'
+             + 'font-family:var(--font-heading);font-weight:800;font-size:20px;text-align:left',
+        onclick: () => go('node:' + node.key),
+      }, [node.name]),
+      stateTag(node.state, transitional(node.state) ? 'busy' : running ? 'up' : 'down'),
+      h('span', { class: 'text-muted', style: 'font-size:12px;margin-left:auto',
+                  text: 'virtual machine' }),
+    ]),
+    h('div', { class: 'text-muted', style: 'font-size:12.5px',
+               text: running
+                 ? 'Emulated aarch64 under TCG. ' + pct(runtime.cpu_percent) + ' of one phone core.'
+                 : 'Remembered but not running. ' + (spec.cores || '?') + ' cores, '
+                   + bytes((spec.memory_mb || 0) * 1024 * 1024) + ' when it is up.' }),
+    running ? dl([
+      ['Processor', pct(runtime.cpu_percent)],
+      ['Resident', bytes(runtime.rss)],
+      ['Uptime', duration(runtime.uptime)],
+    ]) : null,
+    h('div', { style: 'display:flex;gap:8px;margin-top:auto' },
+      actions(node.key, node.state, node.job, node.name)),
+  ]);
+}
+
+function serviceCard(service) {
+  const runtime = service.runtime || {};
+  const metrics = service.metrics || {};
+  const running = service.state === 'running';
+  const rate = metrics.tokens_per_second || metrics.average_tps;
+  return h('article', {
+    style: 'background:var(--color-bg);padding:18px 20px 20px;display:flex;'
+         + 'flex-direction:column;gap:14px;min-width:0',
+  }, [
+    h('div', { style: 'display:flex;align-items:baseline;gap:10px;flex-wrap:wrap' }, [
+      h('button', {
+        type: 'button',
+        style: 'background:transparent;border:0;padding:0;cursor:pointer;font:inherit;color:inherit;'
+             + 'font-family:var(--font-heading);font-weight:800;font-size:20px;text-align:left',
+        onclick: () => go('svc:' + service.id),
+      }, [service.name]),
+      stateTag(service.state, transitional(service.state) ? 'busy' : running ? 'up' : 'down'),
+      h('span', { class: 'text-muted', style: 'font-size:12px;margin-left:auto',
+                  text: service.kind || '' }),
+    ]),
+    service.id === 'dns'
+      ? dl([
+          ['Resolver', service.dns_open ? 'answering on ' + service.dns_port : 'not answering'],
+          ['Resident', bytes(runtime.rss)],
+          ['Uptime', duration(runtime.uptime)],
+        ])
+      : dl([
+          ['Generation', rate ? num(rate, 1) + ' tok/s' : 'no requests yet'],
+          ['Served', num(metrics.tokens_total) + ' tokens'],
+          ['Resident', bytes(runtime.rss)],
+        ]),
+    h('div', { style: 'display:flex;gap:8px;margin-top:auto' },
+      actions('svc:' + service.id, service.state, service.job, service.name)),
+  ]);
+}
+
+function pathsSection(data) {
+  const rows = data.paths || [];
+  if (!rows.length) return null;
+  return h('section', { style: 'padding:24px 24px 40px' }, [
+    sectionHead('Where things run',
+                'Binaries and working directories, read from /proc rather than inferred '
+              + 'from the launchers.'),
+    h('div', { 'data-tx-bleed': 'true', style: 'overflow-x:auto;margin:0 -24px;padding:0 24px' }, [
+      h('table', { class: 'table' }, [
+        h('thead', {}, [h('tr', {}, [
+          h('th', { text: 'App' }), h('th', { text: 'Kind' }),
+          h('th', { text: 'Binary' }), h('th', { text: 'Directory' }), h('th', { text: 'Data' }),
+        ])]),
+        h('tbody', {}, rows.map((row) => h('tr', {}, [
+          h('td', {}, [
+            h('span', { 'data-tx-dot': row.state === 'running' ? 'up' : 'down',
+                        style: 'margin-right:8px' }),
+            row.name,
+          ]),
+          h('td', { class: 'text-muted', text: row.kind || '--' }),
+          h('td', { style: 'font-family:ui-monospace,monospace;font-size:12px',
+                    text: row.binary || 'not running' }),
+          h('td', { style: 'font-family:ui-monospace,monospace;font-size:12px',
+                    text: row.directory || '--' }),
+          h('td', { style: 'font-family:ui-monospace,monospace;font-size:12px',
+                    text: row.detail || '--' }),
+        ]))),
+      ]),
+    ]),
+  ]);
+}
+
+/* ------------------------------------------------------------------ host */
+
+function backButton() {
+  return h('button', {
+    type: 'button', class: 'btn btn-secondary', style: 'justify-content:flex-start',
+    onclick: () => go('overview'),
+  }, ['Back to everything']);
+}
+
+function screenHead(title, note, right) {
+  return h('div', {
+    'data-tx-pad': 'true',
+    style: 'display:flex;align-items:flex-end;justify-content:space-between;gap:24px;'
+         + 'flex-wrap:wrap;padding:24px 24px 16px;border-bottom:' + DIV,
+  }, [
+    h('div', { style: 'min-width:0' }, [
+      h('h1', { style: 'margin:0;font-size:42px', text: title }),
+      note ? h('div', { class: 'text-muted', style: 'font-size:13px', text: note }) : null,
+    ]),
+    right || backButton(),
+  ]);
+}
+
+function renderHost(data) {
+  const host = data.host || {};
+  const id = host.identity || {};
+  const cpu = host.cpu || {};
+  const gpu = host.gpu || {};
+  const battery = host.battery || {};
+  const limits = host.limits || {};
+  const storage = host.storage || [];
   const byId = {};
   (cpu.cores || []).forEach((core) => { byId[core.id] = core; });
 
-  const clusters = (cpu.clusters || []).map((cluster) => {
-    const cores = cluster.cores.map((id) => {
-      const core = byId[id] || { id: id };
-      const label = h('div', { class: 'core' }, [
-        h('div', { class: 'core-label' }, [
-          h('span', { text: 'cpu' + id }),
-          h('span', { text: pct(core.percent) }),
+  const out = [screenHead(id.device || 'This phone',
+    'The machine everything else runs on. '
+    + [id.android ? 'Android ' + id.android : null, 'no root, no container']
+        .filter(Boolean).join(', ') + '.')];
+
+  out.push(h('section', { style: 'padding:24px;border-bottom:' + DIV }, [
+    sectionHead('Cores', limits.cpu_source === 'cpuidle'
+      ? 'Measured from per-core idle residency in sysfs. This device denies /proc/stat '
+        + 'to apps, so utilisation is derived from how long each core stayed idle.'
+      : 'Read from /proc/stat.'),
+    h('div', {}, (cpu.clusters || []).map((cluster) => h('div', { style: 'margin-bottom:22px' }, [
+      h('h6', { style: 'margin:0 0 10px',
+                text: cluster.label + (cluster.max_mhz
+                  ? ' · ' + (cluster.max_mhz / 1000).toFixed(2) + ' GHz' : '') }),
+      h('div', {
+        style: 'display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:16px',
+      }, cluster.cores.map((coreId) => {
+        const core = byId[coreId] || { id: coreId };
+        const hot = (core.percent || 0) >= 99;
+        return h('div', {}, [
+          h('div', {
+            style: 'display:flex;justify-content:space-between;font-size:12px;margin-bottom:5px;'
+                 + 'font-variant-numeric:tabular-nums',
+          }, [
+            h('span', { text: 'cpu' + coreId }),
+            h('span', { style: hot ? 'color:var(--color-accent)' : '', text: pct(core.percent) }),
+          ]),
+          bar(core.percent, hot ? 'accent' : 'blue'),
+          h('div', { class: 'text-muted', style: 'font-size:11px;margin-top:4px',
+                     text: core.mhz ? 'running ' + core.mhz + ' MHz' : 'frequency unreadable' }),
+        ]);
+      })),
+    ]))),
+  ]));
+
+  out.push(h('div', {
+    style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(280px,1fr));gap:2px;'
+         + 'background:var(--color-divider);border-bottom:' + DIV,
+  }, [
+    h('section', { style: 'background:var(--color-bg);padding:24px' }, [
+      h('h3', { style: 'margin:0 0 16px', text: 'Sensors' }),
+      (host.thermals || []).length
+        ? h('div', { style: 'display:flex;flex-wrap:wrap;gap:6px;margin-bottom:18px' },
+            (host.thermals || []).map((zone) => h('span', {
+              class: 'tag tag-neutral', text: zone.zone + ' ' + zone.celsius.toFixed(1) + ' °C',
+            })))
+        : h('div', { class: 'text-muted', style: 'font-size:12.5px;margin-bottom:18px',
+                     text: 'no readable thermal zones' }),
+      dl([
+        ['Battery', battery.available
+          ? [battery.percentage + '%', (battery.status || '').toLowerCase().replace(/_/g, ' '),
+             (battery.health || '').toLowerCase(),
+             battery.celsius ? battery.celsius.toFixed(1) + ' °C' : null]
+              .filter(Boolean).join(' · ')
+          : battery.reason || 'unavailable'],
+      ]),
+    ]),
+    h('section', { style: 'background:var(--color-bg);padding:24px' }, [
+      h('h3', { style: 'margin:0 0 16px', text: 'Storage and graphics' }),
+      h('div', { style: 'margin-bottom:18px' }, storage.map((volume) => h('div', {
+        style: 'margin-bottom:12px',
+      }, [
+        h('div', {
+          style: 'display:flex;justify-content:space-between;font-size:12px;margin-bottom:5px;'
+               + 'font-variant-numeric:tabular-nums',
+        }, [
+          h('span', { text: volume.label }),
+          h('span', { text: bytes(volume.free) + ' free of ' + bytes(volume.total) }),
         ]),
-        meter('', '', core.percent, {
-          tip: '<b>cpu' + id + '</b><br>' + pct(core.percent, 1) +
-               (core.mhz ? '<br>' + core.mhz + ' MHz' : ''),
-        }).lastChild,
-      ]);
-      return label;
-    });
-    return h('div', { class: 'cluster' }, [
-      h('div', { class: 'cluster-name' },
-        [cluster.label + (cluster.max_mhz ? ' · ' + (cluster.max_mhz / 1000).toFixed(2) + ' GHz' : '')]),
-      h('div', { class: 'cores' }, cores),
-    ]);
-  });
-
-  const limits = host.limits || {};
-  const note = host.load
-    ? 'load ' + host.load.one.toFixed(2) + ' · ' + host.load.five.toFixed(2) +
-      ' · ' + host.load.fifteen.toFixed(2)
-    : limits.load ? 'no load average' : null;
-  return card('Processor', note, [
-    sparkline([{ values: history.cpu, color: 'var(--s1)', label: 'total' }],
-      { max: 100, label: 'processor load over the last 90 seconds' }),
-    h('div', { style: 'margin-top:16px' }, clusters),
-    limits.cpu_source === 'cpuidle'
-      ? h('div', { class: 'empty', style: 'margin-top:14px',
-          text: 'Measured from per-core idle residency in sysfs: this device denies '
-            + '/proc/stat to apps, so utilisation is derived from how long each core '
-            + 'stayed in an idle state.' })
-      : null,
-    limits.load
-      ? h('div', { class: 'empty', text: limits.load })
-      : null,
-  ]);
-}
-
-function memoryCard(host, history) {
-  const mem = host.memory || {};
-  return card('Memory', bytes(mem.total) + ' installed', [
-    sparkline([{ values: history.memory, color: 'var(--s1)', label: 'in use' }],
-      { max: 100, label: 'memory in use over the last 90 seconds' }),
-    h('div', { class: 'meters', style: 'margin-top:16px' }, [
-      meter('In use', bytes(mem.used) + ' · ' + pct(mem.percent), mem.percent),
-      mem.swap_total ? meter('Swap', bytes(mem.swap_used) + ' of ' + bytes(mem.swap_total),
-        mem.swap_percent) : null,
-    ].filter(Boolean)),
-    rows([
-      ['Available', bytes(mem.available)],
-      ['Cached', bytes(mem.cached)],
-    ]),
-  ]);
-}
-
-function networkCard(host, history) {
-  const interfaces = host.network || [];
-  const note = interfaces.length
-    ? interfaces.length + (interfaces.length === 1 ? ' interface' : ' interfaces')
-    : 'unavailable';
-  return card('Network', note, [
-    interfaces.length ? sparkline([
-      { values: history.rx, color: 'var(--s1)', label: 'down' },
-      { values: history.tx, color: 'var(--s2)', label: 'up' },
-    ], { format: rate, label: 'network throughput over the last 90 seconds' }) : null,
-    !interfaces.length && (host.limits || {}).network
-      ? h('div', { class: 'later', style: 'margin-top:14px' }, [(host.limits || {}).network])
-      : null,
-    interfaces.length ? h('div', { class: 'table-scroll', style: 'margin-top:14px' }, [
-      h('table', {}, [
-        h('thead', {}, [h('tr', {}, [
-          h('th', { text: 'Interface' }), h('th', { text: 'Down' }), h('th', { text: 'Up' }),
-          h('th', { text: 'Received' }), h('th', { text: 'Sent' }),
-        ])]),
-        h('tbody', {}, interfaces.map((n) => h('tr', {}, [
-          h('td', { text: n.iface }),
-          h('td', { text: rate(n.rx_rate) }),
-          h('td', { text: rate(n.tx_rate) }),
-          h('td', { text: bytes(n.rx_bytes) }),
-          h('td', { text: bytes(n.tx_bytes) }),
-        ]))),
-      ]),
-    ]) : (host.limits || {}).network
-      ? null
-      : h('div', { class: 'empty', text: 'no interfaces with traffic' }),
-  ]);
-}
-
-function storageCard(host) {
-  const volumes = host.storage || [];
-  if (!volumes.length) return card('Storage', null, [h('div', { class: 'empty', text: 'nothing readable' })]);
-  return card('Storage', null, [
-    h('div', { class: 'meters' }, volumes.map((v) =>
-      meter(v.label, bytes(v.free) + ' free', v.percent, {
-        tip: '<b>' + v.path + '</b><br>' + bytes(v.used) + ' of ' + bytes(v.total) +
-             ' used<br>' + pct(v.percent, 1),
-      }))),
-  ]);
-}
-
-function gpuCard(host) {
-  const gpu = host.gpu || {};
-  if (!gpu.available) {
-    return card('Graphics', null, [
-      h('div', { class: 'empty', text: gpu.reason || 'unavailable' }),
-    ]);
-  }
-  const clockNote = gpu.clock_mhz && gpu.max_clock_mhz && gpu.clock_percent < 95
-    ? 'The driver is holding the clock below its ' + gpu.max_clock_mhz +
-      ' MHz ceiling. Raising that needs root.'
-    : null;
-  return card('Graphics', gpu.model || null, [
-    h('div', { class: 'tiles', style: 'margin-bottom:14px' }, [
-      tile('Utilisation', num(gpu.percent), '%', 'of the whole GPU', true),
-      tile('Clock', num(gpu.clock_mhz), ' MHz',
-           gpu.max_clock_mhz ? 'ceiling ' + gpu.max_clock_mhz + ' MHz' : ''),
-    ]),
-    h('div', { class: 'meters' }, [
-      meter('Busy', pct(gpu.percent, 1), gpu.percent),
-      gpu.clock_percent === null || gpu.clock_percent === undefined ? null
-        : meter('Clock of maximum', pct(gpu.clock_percent, 0), gpu.clock_percent,
-            { severity: false }),
-    ].filter(Boolean)),
-    clockNote ? h('div', { class: 'empty', text: clockNote }) : null,
-  ]);
-}
-
-function dnsTiles(service) {
-  const runtime = service.runtime || {};
-  const stats = service.dns_stats;
-  const tiles = [
-    tile('Resolver', service.dns_open ? 'up' : 'down',
-         '', 'port ' + (service.dns_port || '--'), true),
-  ];
-  // filtering state comes from an authenticated endpoint; a permanent "--"
-  // tile is worse than no tile
-  if (service.protection !== undefined && service.protection !== null) {
-    tiles.push(tile('Filtering', service.protection ? 'on' : 'off', '',
-      service.dns_version ? 'AdGuard ' + service.dns_version : ''));
-  }
-  if (stats) {
-    tiles.push(tile('Queries', num(stats.queries), '', 'answered'));
-    tiles.push(tile('Blocked', num(stats.blocked), '',
-      stats.blocked_percent === null ? '' : pct(stats.blocked_percent, 1) + ' of queries'));
-    tiles.push(tile('Latency', num(stats.avg_ms, 1), ' ms', 'average'));
-  }
-  tiles.push(tile('Processor', num(runtime.cpu_percent), '%',
-    'of one phone core' + (runtime.pid ? ' · pid ' + runtime.pid : '')));
-  tiles.push(tile('Resident', bytes(runtime.rss), '',
-    runtime.threads ? runtime.threads + ' threads' : ''));
-  tiles.push(tile('Uptime', duration(runtime.uptime), '', ''));
-  return h('div', { class: 'tiles' }, tiles);
-}
-
-function dnsCard(service, host) {
-  const address = ((host || {}).identity || {}).address || 'this-phone';
-  const admin = (service.endpoint || '').replace('127.0.0.1', address);
-  const resolver = address + ':' + (service.dns_port || '--');
-
-  return card('Resolver', 'point clients here', [
-    h('div', { style: 'margin-bottom:16px' }, [
-      link(admin, 'Open the AdGuard admin →', 'open-button'),
-    ]),
-    rows([
-      ['DNS server', h('span', { class: 'mono', text: resolver })],
-      ['Admin', link(admin, admin)],
-      ['Status', service.dns_open
-        ? pill('answering queries', 'good') : pill('not answering', 'critical')],
-      service.protection === undefined || service.protection === null ? null
-        : ['Filtering', service.protection ? pill('on', 'good') : pill('off', 'warning')],
-    ]),
-    h('div', { class: 'empty',
-      text: 'Port 53 needs root, so the resolver listens on '
-        + (service.dns_port || '5300') + '. Clients have to name that port '
-        + 'explicitly; most routers allow it, most phones do not.' }),
-    service.dns_stats ? null : h('div', { class: 'empty',
-      text: 'Query and block counts live behind the AdGuard login, so they are '
-        + 'shown in the admin rather than here.' }),
-  ]);
-}
-
-function serviceTiles(service, host) {
-  const runtime = service.runtime || {};
-  const metrics = service.metrics || {};
-  const gpu = (host || {}).gpu || {};
-  // The per-second gauge is reset by llama.cpp whenever /metrics is read, so
-  // it is usually zero by the time the UI sees it. The lifetime average,
-  // derived from monotonic counters, is the number that is always true.
-  const live = metrics.tokens_per_second;
-  const rate = live ? live : metrics.average_tps;
-  return h('div', { class: 'tiles' }, [
-    tile('Generation', num(rate, 1), ' tok/s',
-         live ? 'last request' : (metrics.average_tps ? 'average since start' : 'no requests yet'), true),
-    tile('Prompt', num(metrics.prompt_per_second || metrics.average_prompt_tps, 1),
-         ' tok/s',
-         metrics.prompt_cached ? num(metrics.prompt_cached) + ' tokens cached'
-           : (metrics.prompt_per_second ? 'last request' : 'average since start')),
-    tile('Processor', num(runtime.cpu_percent), '%',
-         'of one phone core' + (runtime.pid ? ' · pid ' + runtime.pid : '')),
-    tile('Resident', bytes(runtime.rss), '',
-         runtime.threads ? runtime.threads + ' threads' : ''),
-    tile('Served', num(metrics.tokens_total), '',
-         'tokens generated since start'),
-    service.uses_gpu && gpu.available
-      ? tile('Graphics', num(gpu.percent), '%',
-             (gpu.model || 'GPU') + ' · ' + (gpu.clock_mhz || '--') + ' MHz')
-      : null,
-    tile('Uptime', duration(runtime.uptime), '',
-         metrics.processing ? num(metrics.processing) + ' in flight' : 'idle'),
-  ]);
-}
-
-function serviceTrendCard(service) {
-  const history = service.history || {};
-  if (!(history.rate || []).some((v) => v !== null && v !== undefined)) return null;
-  return card('Trend', 'last ' + Math.round((history.rate || []).length * 3) + ' seconds', [
-    h('div', { class: 'grid two', style: 'gap:22px' }, [
-      h('div', {}, [
-        h('div', { class: 'card-title', style: 'margin-bottom:8px', text: 'Generation rate' }),
-        sparkline([{ values: history.rate, color: 'var(--s1)', label: 'tok/s' }],
-          { step: 3, format: (v) => num(v, 1) + ' tok/s',
-            label: 'generation rate over time' }),
-      ]),
-      h('div', {}, [
-        h('div', { class: 'card-title', style: 'margin-bottom:8px', text: 'Processor' }),
-        sparkline([{ values: history.cpu, color: 'var(--s2)', label: 'cpu' }],
-          { step: 3, label: 'processor use by the model server' }),
-      ]),
-      (history.gpu || []).some((v) => v !== null && v !== undefined)
-        ? h('div', {}, [
-            h('div', { class: 'card-title', style: 'margin-bottom:8px', text: 'Graphics' }),
-            sparkline([{ values: history.gpu, color: 'var(--s1)', label: 'gpu' }],
-              { step: 3, max: 100, label: 'graphics load while this server works' }),
+        bar(volume.percent),
+      ]))),
+      gpu.available
+        ? dl([
+            [gpu.model || 'GPU', pct(gpu.percent) + ' busy'],
+            ['Clock', (gpu.clock_mhz || '--') + ' of ' + (gpu.max_clock_mhz || '--')
+                    + ' MHz · ' + pct(gpu.clock_percent)],
+            ['Ceiling', 'the driver holds it down; raising it needs root'],
           ])
-        : null,
-    ].filter(Boolean)),
-  ]);
-}
-
-function endpointCard(service, host) {
-  const address = ((host || {}).identity || {}).address || 'this-phone';
-  const base = (service.endpoint || '').replace('127.0.0.1', address);
-  return card('Endpoints', 'reachable from anything on the network', [
-    rows([
-      ['OpenAI-compatible', h('span', { class: 'mono', text: base + '/v1' })],
-      ['Native', h('span', { class: 'mono', text: base })],
-      ['Model id', h('span', { class: 'mono',
-        text: service.served_model || '(unknown)' })],
+        : h('div', { class: 'text-muted', style: 'font-size:12.5px', text: gpu.reason || 'no GPU readings' }),
     ]),
-    h('div', { class: 'empty',
-      text: 'Point Page Assist or any OpenAI-compatible client at the /v1 URL. '
-        + 'No API key is checked, so keep it on the LAN.' }),
+    h('section', { style: 'background:var(--color-bg);padding:24px' }, [
+      h('h3', { style: 'margin:0 0 16px', text: 'Device' }),
+      dl([
+        ['Model', id.device || 'unknown'],
+        id.soc ? ['Chipset', id.soc] : null,
+        id.android ? ['Android', id.android + (id.sdk ? ' (API ' + id.sdk + ')' : '')] : null,
+        ['Kernel', id.kernel],
+        ['Architecture', id.arch],
+        ['Address', id.address || 'unknown'],
+      ]),
+    ]),
+  ]));
+
+  const missing = [
+    limits.load ? ['Load average', limits.load] : null,
+    limits.network ? ['Network throughput', limits.network] : null,
+    !gpu.available && gpu.reason ? ['Graphics', gpu.reason] : null,
+    !battery.available && battery.reason ? ['Battery', battery.reason] : null,
+  ].filter(Boolean);
+  if (missing.length) {
+    out.push(h('section', { style: 'padding:24px 24px 40px' }, [
+      sectionHead('What this device will not tell us',
+                  'Every one of these is a policy denial, not a bug. Where there is no way '
+                + 'through, the panel says so rather than showing a zero.'),
+      dl(missing),
+      h('div', { style: 'margin-top:20px' }, [backButton()]),
+    ]));
+  } else {
+    out.push(h('section', { style: 'padding:24px 24px 40px' }, [backButton()]));
+  }
+  return out;
+}
+
+/* --------------------------------------------------------------- service */
+
+function launcherPanel(target) {
+  const log = state.logs[target];
+  if (log === undefined) {
+    fetch('/api/launchlog?target=' + encodeURIComponent(target),
+          { headers: TOKEN ? { 'X-Termox-Token': TOKEN } : {} })
+      .then((r) => r.json())
+      .then((data) => { state.logs[target] = data; render(); })
+      .catch(() => { state.logs[target] = { ok: false, reason: 'could not be read' }; });
+    state.logs[target] = null;
+  }
+  return h('section', { style: 'background:var(--color-bg);padding:24px' }, [
+    h('div', { style: 'display:flex;align-items:baseline;gap:12px;margin-bottom:14px' }, [
+      h('h3', { style: 'margin:0', text: 'Launcher output' }),
+      h('span', { class: 'text-muted', style: 'font-size:12px',
+                  text: log && log.session ? log.session + ' · last start' : 'last start' }),
+    ]),
+    log === null
+      ? h('div', { class: 'text-muted', style: 'font-size:12.5px', text: 'reading…' })
+      : log && log.ok
+        ? h('pre', { class: 'tx-log', text: log.lines.join('\n') })
+        : h('div', { class: 'text-muted', style: 'font-size:12.5px',
+                     text: (log && log.reason) || 'nothing recorded' }),
+    h('div', { style: 'display:flex;gap:8px;margin-top:14px' }, [
+      h('button', {
+        type: 'button', class: 'btn btn-secondary', style: 'justify-content:flex-start',
+        onclick: () => { delete state.logs[target]; render(); },
+      }, ['Refresh']),
+    ]),
   ]);
 }
 
-function serviceDetailCard(service, host) {
-  const runtime = service.runtime || {};
-  const gpu = (host || {}).gpu || {};
-  if (service.id === 'dns') {
-    return card('Runtime', service.kind || null, [
-      rows([
-        service.dns_version ? ['Version', service.dns_version] : null,
-        ['Binary', h('span', { class: 'mono',
-          text: (runtime.binary || '--').split('/').pop() })],
-        ['Directory', h('span', { class: 'mono', text: runtime.directory || '--' })],
-        runtime.cores ? ['Cores', runtime.cores.join(', ')] : null,
-        runtime.nice === null || runtime.nice === undefined
-          ? null : ['Priority', 'nice ' + runtime.nice],
-      ]),
-    ]);
+/* One real request against the model server, so the panel can show what it
+   measured rather than describing what it would measure. */
+async function send(service) {
+  const prompt = state.draft.trim();
+  if (!prompt || state.sending) return;
+  const base = (service.endpoint || '').replace('127.0.0.1', location.hostname);
+  state.sending = true;
+  state.chat.push({ who: 'you', text: prompt, meta: '' });
+  state.draft = '';
+  render();
+  const started = Date.now();
+  try {
+    const response = await fetch(base + '/v1/chat/completions', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: service.served_model || 'local',
+        messages: [{ role: 'user', content: prompt }],
+        max_tokens: 160,
+      }),
+    });
+    const data = await response.json();
+    const message = (data.choices && data.choices[0] && data.choices[0].message) || {};
+    const usage = data.usage || {};
+    const seconds = (Date.now() - started) / 1000;
+    state.chat.push({
+      who: service.name,
+      text: message.content || '(the model returned nothing; it may have spent the budget thinking)',
+      meta: [usage.completion_tokens ? usage.completion_tokens + ' tokens' : null,
+             seconds.toFixed(1) + 's',
+             usage.completion_tokens ? (usage.completion_tokens / seconds).toFixed(1) + ' tok/s' : null]
+              .filter(Boolean).join(' · '),
+    });
+  } catch (err) {
+    state.chat.push({ who: 'error', text: String(err.message || err), meta: '' });
+  } finally {
+    state.sending = false;
+    render();
   }
-  return card('Runtime', service.kind || null, [
-    rows([
-      ['Model', service.model ? service.model.split('/').pop() : 'unknown'],
-      service.context ? ['Context', num(service.context) + ' tokens'] : null,
-      ['Accelerator', service.uses_gpu
-        ? (gpu.available
-            ? (gpu.model || 'GPU') + ' · ' + pct(gpu.percent) + ' busy · ' +
-              (gpu.clock_mhz || '--') + ' MHz'
-            : 'GPU requested but unreadable')
-        : 'processor only'],
-      runtime.cores ? ['Cores', runtime.cores.join(', ')] : null,
-      runtime.nice === null || runtime.nice === undefined
-        ? null : ['Priority', 'nice ' + runtime.nice],
+}
+
+function tryItPanel(service) {
+  return h('section', { style: 'background:var(--color-bg);padding:24px' }, [
+    sectionHead('Try it', 'Sends one request to /v1/chat/completions and shows what it measured.'),
+    h('div', { style: 'display:flex;flex-direction:column;gap:12px;margin-bottom:16px' },
+      state.chat.length
+        ? state.chat.map((m) => h('div', { style: 'max-width:60ch' }, [
+            h('div', { class: 'text-muted',
+                       style: 'font-size:11px;letter-spacing:.08em;text-transform:uppercase',
+                       text: m.who }),
+            h('div', { style: 'font-size:13.5px;line-height:1.5;white-space:pre-wrap', text: m.text }),
+            m.meta ? h('div', { class: 'text-muted', style: 'font-size:11px;margin-top:3px', text: m.meta }) : null,
+          ]))
+        : [h('div', { class: 'text-muted', style: 'font-size:13px',
+                      text: 'Nothing sent yet. The first request loads nothing extra, '
+                          + 'the weights are already resident.' })]),
+    h('div', { style: 'display:flex;gap:8px;align-items:flex-end' }, [
+      h('div', { class: 'field', style: 'flex:1;min-width:0' }, [
+        h('label', { text: 'Prompt' }),
+        h('input', {
+          class: 'input', type: 'text', value: state.draft, placeholder: 'Name three colours',
+          oninput: (e) => { state.draft = e.target.value; },
+          onkeydown: (e) => { if (e.key === 'Enter') send(service); },
+        }),
+      ]),
+      h('button', {
+        type: 'button', class: 'btn btn-primary', style: 'justify-content:flex-start',
+        disabled: state.sending, onclick: () => send(service),
+      }, [state.sending ? h('span', { class: 'tx-spin' }) : null, state.sending ? 'Sending' : 'Send']),
     ]),
   ]);
 }
 
 function renderService(data, service) {
-  const stage = $('stage');
-  stage.textContent = '';
+  const runtime = service.runtime || {};
+  const metrics = service.metrics || {};
+  const gpu = (data.host || {}).gpu || {};
+  const address = ((data.host || {}).identity || {}).address || location.hostname;
+  const target = 'svc:' + service.id;
   const running = service.state === 'running';
   const isDns = service.id === 'dns';
+  const out = [];
 
-  const target = 'svc:' + service.id;
-  stage.appendChild(h('div', { class: 'stage-head' }, [
-    h('h1', { class: 'stage-title', text: service.name }),
-    pill(service.job ? service.state : service.state,
-      running ? 'good' : service.state === 'starting' ? 'warning'
-        : service.state === 'stopping' ? 'warning' : 'idle'),
-    h('div', { style: 'margin-left:auto' }, [
-      actionBar(target, service.state, service.job, service.name),
+  out.push(h('div', {
+    'data-tx-pad': 'true',
+    style: 'display:flex;align-items:flex-end;justify-content:space-between;gap:24px;'
+         + 'flex-wrap:wrap;padding:24px 24px 16px;border-bottom:' + DIV,
+  }, [
+    h('div', { style: 'min-width:0' }, [
+      h('div', { style: 'display:flex;align-items:center;gap:12px;flex-wrap:wrap' }, [
+        h('h1', { style: 'margin:0;font-size:42px', text: service.name }),
+        stateTag(service.state, transitional(service.state) ? 'busy' : running ? 'up' : 'down'),
+      ]),
+      h('div', { class: 'text-muted', style: 'font-size:13px',
+                 text: isDns
+                   ? 'AdGuard Home, built for this phone and running natively. '
+                     + 'Port 53 needs root, so it answers on ' + (service.dns_port || 5300) + '.'
+                   : (service.kind || '') + '. '
+                     + (service.model ? service.model.split('/').pop() : 'no model loaded')
+                     + (service.context ? ', ' + num(service.context) + ' tokens of context' : '') }),
     ]),
+    h('div', { style: 'display:flex;gap:8px' },
+      actions(target, service.state, service.job, service.name)),
   ]));
 
-  const strip = activityStrip(service.job, service.state);
-  if (strip) stage.appendChild(strip);
+  const strip = activity(service.job, service.state);
+  if (strip) out.push(strip);
 
-  stage.appendChild(isDns ? dnsTiles(service) : serviceTiles(service, data.host));
-  const trend = serviceTrendCard(service);
-  if (trend) stage.appendChild(trend);
-  stage.appendChild(h('div', { class: 'grid two' }, [
-    serviceDetailCard(service, data.host),
-    isDns ? dnsCard(service, data.host) : endpointCard(service, data.host),
-  ]));
-}
+  out.push(h('div', {
+    style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:2px;'
+         + 'background:var(--color-divider);border-bottom:' + DIV,
+  }, isDns ? [
+    tile('Resolver', service.dns_open ? 'up' : 'down', '', 'port ' + (service.dns_port || '--')),
+    tile('Processor', num(runtime.cpu_percent), '%', 'of one phone core'),
+    tile('Resident', bytes(runtime.rss), '', (runtime.threads || '--') + ' threads'),
+    tile('Uptime', duration(runtime.uptime), '', 'pid ' + (runtime.pid || '--')),
+  ] : [
+    tile('Generation', num(metrics.tokens_per_second || metrics.average_tps, 1), ' tok/s',
+         metrics.tokens_per_second ? 'last request' : 'average since start'),
+    tile('Prompt', num(metrics.prompt_per_second || metrics.average_prompt_tps, 1), ' tok/s',
+         metrics.prompt_cached ? num(metrics.prompt_cached) + ' tokens cached' : ''),
+    tile('Served', num(metrics.tokens_total), '', 'tokens since start'),
+    tile('Resident', bytes(runtime.rss), '',
+         (runtime.threads || '--') + ' threads · pid ' + (runtime.pid || '--')),
+    service.uses_gpu && gpu.available
+      ? tile('Graphics', num(gpu.percent), '%', (gpu.clock_mhz || '--') + ' MHz')
+      : null,
+    tile('Uptime', duration(runtime.uptime), '',
+         metrics.processing ? num(metrics.processing) + ' in flight' : 'idle'),
+  ].filter(Boolean)));
 
-function sensorsCard(host) {
-  const battery = host.battery || {};
-  const thermals = host.thermals || [];
-  return card('Sensors', null, [
-    thermals.length
-      ? h('div', { class: 'chips' }, thermals.map((z) =>
-          pill(z.zone + ' ' + z.celsius.toFixed(1) + ' °C',
-               z.celsius >= 60 ? 'critical' : z.celsius >= 48 ? 'warning' : 'good')))
-      : h('div', { class: 'empty', text: 'no readable thermal zones' }),
-    h('div', { style: 'margin-top:14px' }, [rows([
-      ['Battery', battery.available
-        ? [battery.percentage + '%', battery.status, battery.health,
-           battery.celsius ? battery.celsius.toFixed(1) + ' °C' : null].filter(Boolean).join(' · ')
-        : battery.reason || 'unavailable'],
-    ])]),
-  ]);
-}
-
-function activityCard(data) {
-  const jobs = (data.jobs || []).slice(0, 6);
-  if (!jobs.length) return null;
-  return card('Recent actions', 'start and stop history since the panel came up', [
-    h('div', { class: 'rows' }, jobs.map((job) => h('div', { class: 'row' }, [
-      h('dt', {}, [
-        pill(job.action, job.state === 'done' ? 'good'
-          : job.state === 'failed' ? 'critical' : 'warning'),
-        h('span', { style: 'margin-left:8px', text: job.label }),
-      ]),
-      h('dd', {}, [
-        h('span', { class: 'meter-label', text: job.message }),
-        h('span', { style: 'color:var(--muted); margin-left:10px',
-          text: ago((Date.now() / 1000) - job.started) }),
-      ]),
-    ]))),
-  ]);
-}
-
-function pathsCard(data) {
-  const rows = data.paths || [];
-  if (!rows.length) return null;
-  return card('Where things run', 'binaries and working directories, read from /proc', [
-    h('div', { class: 'table-scroll' }, [h('table', {}, [
-      h('thead', {}, [h('tr', {}, [
-        h('th', { text: 'App' }), h('th', { text: 'Kind' }),
-        h('th', { text: 'Binary' }), h('th', { text: 'Directory' }),
-        h('th', { text: 'Data' }),
-      ])]),
-      h('tbody', {}, rows.map((r) => h('tr', {}, [
-        h('td', {}, [
-          h('span', { class: 'pill ' + (r.state === 'running' ? 'good' : 'idle') },
-            [h('i'), r.name]),
-        ]),
-        h('td', { text: r.kind || '--' }),
-        h('td', { class: 'mono wrap', text: r.binary || 'not running' }),
-        h('td', { class: 'mono wrap', text: r.directory || '--' }),
-        h('td', { class: 'mono wrap', text: r.detail || '--' }),
-      ]))),
-    ])]),
-  ]);
-}
-
-function deviceCard(host) {
-  const id = host.identity || {};
-  return card('Device', null, [rows([
-    ['Model', id.device || 'unknown'],
-    id.soc ? ['Chipset', id.soc] : null,
-    id.android ? ['Android', id.android + (id.sdk ? ' (API ' + id.sdk + ')' : '')] : null,
-    ['Kernel', id.kernel],
-    ['Architecture', id.arch],
-    ['Hostname', id.hostname],
-    ['Address', id.address || 'unknown'],
-  ])]);
-}
-
-function renderHost(data) {
-  const host = data.host;
-  const stage = $('stage');
-  stage.textContent = '';
-  if (!host) {
-    stage.appendChild(h('div', { class: 'empty', text: 'waiting for the first sample' }));
-    return;
-  }
-  const id = host.identity || {};
-  stage.appendChild(h('div', { class: 'stage-head' }, [
-    h('h1', { class: 'stage-title', text: id.device || id.hostname || 'This phone' }),
-    h('span', { class: 'stage-note', text: 'the machine everything else runs on' }),
-  ]));
-  if ((data.control || {}).enabled && !(data.control || {}).token_required) {
-    stage.appendChild(h('div', { class: 'notice' }, [
-      h('span', {}, [h('b', { text: 'Anyone on this network can start and stop these. ' }),
-        'Set TERMOX_TOKEN to require a token.']),
+  if (!isDns) {
+    const rate = serviceReading(service.id, 'rate');
+    const proc = serviceReading(service.id, 'cpu');
+    const gpuSeries = serviceReading(service.id, 'gpu');
+    out.push(h('section', { style: 'padding:24px;border-bottom:' + DIV }, [
+      h('div', {
+        'data-tx-charts': 'true',
+        style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:32px',
+      }, [
+        figure('Generation rate',
+               readout(num(latest(rate), 1) + ' tok/s', 'peak ' + num(peak(rate), 1)),
+               rate, { hue: 'green', label: 'generation rate',
+                       note: "llama.cpp resets its per-second gauges on scrape, so this is the "
+                           + "finished request's own rate" }),
+        figure('Processor',
+               readout(pct(latest(proc)), 'peak ' + pct(peak(proc))),
+               proc, { hue: 'blue', label: 'processor use' }),
+        service.uses_gpu
+          ? figure('Graphics while this server works',
+                   readout(pct(latest(gpuSeries)), 'peak ' + pct(peak(gpuSeries))),
+                   gpuSeries, { hue: 'teal', max: 100, label: 'graphics load' })
+          : null,
+      ].filter(Boolean)),
     ]));
   }
-  stage.appendChild(hostTiles(host, data.nodes || []));
 
-  const pairs = [
-    [cpuCard(host, data.history), memoryCard(host, data.history)],
-    [gpuCard(host), storageCard(host)],
-    [networkCard(host, data.history), sensorsCard(host)],
-    [deviceCard(host), null],
-    [activityCard(data), null],
-    [pathsCard(data), null],
-  ];
-  pairs.forEach((row) => {
-    const cards = row.filter(Boolean);
-    if (cards.length) stage.appendChild(h('div', { class: 'grid two' }, cards));
-  });
+  const endpointRows = isDns
+    ? [['DNS server', h('span', { style: 'font-family:ui-monospace,monospace',
+                                  text: address + ':' + (service.dns_port || '--') })],
+       ['Admin', h('a', { href: (service.endpoint || '').replace('127.0.0.1', address),
+                          target: '_blank', rel: 'noreferrer',
+                          text: (service.endpoint || '').replace('127.0.0.1', address) })],
+       ['Status', service.dns_open ? 'answering queries' : 'not answering']]
+    : [['OpenAI-compatible', h('span', { style: 'font-family:ui-monospace,monospace',
+        text: (service.endpoint || '').replace('127.0.0.1', address) + '/v1' })],
+       ['Native', h('span', { style: 'font-family:ui-monospace,monospace',
+        text: (service.endpoint || '').replace('127.0.0.1', address) })],
+       ['Model id', h('span', { style: 'font-family:ui-monospace,monospace',
+        text: service.served_model || '(unknown)' })],
+       runtime.cores ? ['Cores', runtime.cores.join(', ') + ' · nice ' + (runtime.nice === null ? '--' : runtime.nice)] : null];
+
+  out.push(h('div', {
+    style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:2px;'
+         + 'background:var(--color-divider);border-bottom:' + DIV,
+  }, [
+    h('section', { style: 'background:var(--color-bg);padding:24px' }, [
+      h('h3', { style: 'margin:0 0 16px', text: isDns ? 'Resolver' : 'Endpoints' }),
+      isDns
+        ? h('div', { style: 'margin-bottom:16px' }, [
+            h('a', { class: 'btn btn-primary', style: 'justify-content:flex-start',
+                     href: (service.endpoint || '').replace('127.0.0.1', address),
+                     target: '_blank', rel: 'noreferrer', text: 'Open the AdGuard admin' }),
+          ])
+        : null,
+      dl(endpointRows.filter(Boolean)),
+      h('div', { class: 'text-muted', style: 'font-size:12px;margin-top:12px',
+                 text: isDns
+                   ? 'Query and block counts live behind the AdGuard login, so they are shown '
+                     + 'in the admin rather than here.'
+                   : 'No API key is checked. Point Page Assist or any OpenAI-compatible client '
+                     + 'at the /v1 URL and keep it on the LAN.' }),
+    ]),
+    launcherPanel(target),
+  ]));
+
+  if (!isDns && running) out.push(tryItPanel(service));
+
+  out.push(h('section', { style: 'padding:24px 24px 40px' }, [backButton()]));
+  return out;
 }
 
-/* ------------------------------------------------------------------- vm */
+/* --------------------------------------------------------------- machine */
 
-function vmTiles(node, guest) {
+function renderNode(data, node) {
   const runtime = node.runtime || {};
   const spec = node.spec || {};
-  const tiles = [
-    tile('Emulator load', num(runtime.cpu_percent), '%',
-         'of one phone core' + (runtime.pid ? ' · pid ' + runtime.pid : ''), true),
-  ];
-  if (guest && guest.ok && guest.cpu) {
-    tiles.push(tile('Guest processor', num(guest.cpu.total), '%',
-      (guest.cpu.count || spec.cores || 0) + ' virtual cores'));
-    if (guest.memory) {
-      tiles.push(tile('Guest memory', num(guest.memory.percent), '%',
-        bytes(guest.memory.used) + ' of ' + bytes(guest.memory.total)));
-    }
-  } else {
-    tiles.push(tile('Allocated', spec.cores || '--', ' cores',
-      spec.memory_mb ? bytes(spec.memory_mb * 1024 * 1024) + ' of memory' : ''));
-  }
-  tiles.push(tile('Resident', bytes(runtime.rss), '',
-    runtime.threads ? runtime.threads + ' threads' : ''));
-  tiles.push(tile('Uptime', duration(runtime.uptime), '',
-    node.boots ? node.boots + (node.boots === 1 ? ' boot seen' : ' boots seen') : ''));
-  return h('div', { class: 'tiles' }, tiles);
-}
-
-function vmTrendCard(node, guest) {
-  const history = node.history || {};
-  const hasGuest = (history.guest || []).some((v) => v !== null && v !== undefined);
-  const cards = [
-    h('div', {}, [
-      h('div', { class: 'card-title', style: 'margin-bottom:8px', text: 'Emulator load' }),
-      sparkline([{ values: history.cpu, color: 'var(--s1)', label: 'emulator' }],
-        { step: 2, label: 'phone cost of running this machine' }),
-    ]),
-  ];
-  if (hasGuest) {
-    cards.push(h('div', {}, [
-      h('div', { class: 'card-title', style: 'margin-bottom:8px', text: 'Guest processor' }),
-      sparkline([{ values: history.guest, color: 'var(--s2)', label: 'guest' }],
-        { step: 2, max: 100, label: 'load inside the guest' }),
-    ]));
-  }
-  return card('Trend', 'last ' + Math.round((history.cpu || []).length * 2) + ' seconds', [
-    h('div', { class: 'grid two', style: 'gap:22px' }, cards),
-    h('div', { class: 'empty',
-      text: hasGuest
-        ? 'Two scales, two charts: emulator load is a share of one phone core and can pass 100%, '
-          + 'while guest load is a share of the machine\'s own cores.'
-        : 'Guest load appears here once the dashboard can read inside the machine.' }),
-  ]);
-}
-
-function specCard(node) {
-  const spec = node.spec || {};
-  return card('Machine', spec.binary, [rows([
-    ['Architecture', spec.arch || 'unknown'],
-    ['Machine type', spec.machine || 'default'],
-    ['Processor model', spec.cpu || 'default'],
-    ['Virtual cores', spec.cores === null ? 'unset' : String(spec.cores)],
-    ['Memory', spec.memory_mb ? bytes(spec.memory_mb * 1024 * 1024) : 'unset'],
-    ['Acceleration', spec.accel === 'tcg'
-      ? pill('tcg · full emulation', 'warning') : pill(spec.accel, 'good')],
-    ['Console', spec.display || 'default'],
-    spec.cwd ? ['Started in', h('span', { class: 'mono', text: spec.cwd })] : null,
-  ])]);
-}
-
-function disksCard(node) {
-  const spec = node.spec || {};
-  const disks = (spec.disks || []).concat(spec.cdroms || []);
-  if (!disks.length) return null;
-  return card('Storage', null, [
-    h('div', { class: 'meters' }, disks.map((d) => {
-      if (d.missing) {
-        return meter(d.name, 'file is missing', 0, { severity: false });
-      }
-      const percent = d.virtual ? (d.allocated / d.virtual) * 100 : null;
-      return meter(d.name,
-        bytes(d.allocated) + (d.virtual ? ' of ' + bytes(d.virtual) : ''),
-        percent === null ? 0 : percent, {
-          warn: 80, serious: 90, critical: 96,
-          tip: '<b>' + d.path + '</b><br>' + (d.format || 'raw') +
-               (d.interface ? ' · ' + d.interface : '') +
-               '<br>allocated ' + bytes(d.allocated) +
-               (d.virtual ? '<br>virtual ' + bytes(d.virtual) : ''),
-        });
-    })),
-    h('div', { class: 'empty', text: 'qcow2 images grow as the guest writes' }),
-  ]);
-}
-
-function portsCard(node) {
-  const ports = node.ports || [];
-  if (!ports.length) {
-    return card('Ports', null, [h('div', { class: 'empty',
-      text: 'no forwards on the command line, so nothing on the phone reaches this guest' })]);
-  }
-  return card('Ports', 'forwarded from the phone', [
-    h('div', { class: 'chips' }, ports.map((p) => {
-      const label = p.proto + ' ' + p.host_port + ' → ' + p.guest_port +
-        (p.label ? ' · ' + p.label : '');
-      if (p.proto !== 'tcp') return pill(label, 'idle');
-      return pill(label + (p.open ? ' · open' : ' · closed'), p.open ? 'good' : 'idle');
-    })),
-  ]);
-}
-
-function guestCard(node, guest) {
-  if (!guest) {
-    return card('Inside the guest', null, [h('div', { class: 'empty', text: 'not sampled yet' })]);
-  }
-  if (!guest.ok) {
-    return card('Inside the guest', guest.endpoint || null, [
-      h('div', { class: 'empty', text: guest.reason || 'unreachable' }),
-      guest.configured === false ? null : h('pre', { class: 'cmdline',
-        text: 'python3 -m termox setup-guest' }),
-    ]);
-  }
-  const mem = guest.memory || {};
-  return card('Inside the guest', guest.endpoint + ' · ' + guest.latency_ms + ' ms', [
-    rows([
-      ['Hostname', guest.hostname || '--'],
-      ['System', guest.os || '--'],
-      ['Kernel', guest.kernel || '--'],
-      ['Uptime', duration(guest.uptime)],
-      ['Load', guest.load ? guest.load.map((v) => v.toFixed(2)).join(' · ') : '--'],
-    ]),
-    h('div', { class: 'meters', style: 'margin-top:14px' }, [
-      meter('Memory', bytes(mem.used) + ' of ' + bytes(mem.total), mem.percent),
-    ].concat((guest.filesystems || []).map((fs) =>
-      meter(fs.mount, bytes(fs.free) + ' free', fs.percent, {
-        tip: '<b>' + fs.device + '</b> on ' + fs.mount + '<br>' +
-             bytes(fs.used) + ' of ' + bytes(fs.total),
-      })))),
-  ]);
-}
-
-function containersCard(guest) {
-  if (!guest || !guest.ok || !guest.docker) return null;
-  const docker = guest.docker;
-  if (!docker.installed) return null;
-  const list = docker.containers || [];
-  const note = docker.age === null || docker.age < 0
-    ? 'first reading on the way'
-    : 'read ' + ago(docker.age) + ' · refreshed every ' + Math.round(docker.refresh) + 's';
-
-  if (!list.length) {
-    return card('Containers', note, [h('div', { class: 'empty',
-      text: docker.age < 0
-        ? 'docker is installed; the first listing takes about twenty seconds under emulation'
-        : 'no containers' })]);
-  }
-  return card('Containers', note, [
-    h('div', { class: 'table-scroll' }, [h('table', {}, [
-      h('thead', {}, [h('tr', {}, [
-        h('th', { text: 'Name' }), h('th', { text: 'Image' }), h('th', { text: 'State' }),
-        h('th', { text: 'Processor' }), h('th', { text: 'Memory' }), h('th', { text: 'Network' }),
-      ])]),
-      h('tbody', {}, list.map((c) => h('tr', {}, [
-        h('td', { text: c.name }),
-        h('td', { class: 'wrap', text: c.image }),
-        h('td', {}, [pill(c.state, c.state === 'running' ? 'good' : 'idle')]),
-        h('td', { text: c.cpu_percent === null ? '--' : pct(c.cpu_percent, 1) }),
-        h('td', { text: c.mem_used === null ? '--' : bytes(c.mem_used) +
-          (c.mem_percent === null ? '' : ' · ' + pct(c.mem_percent, 1)) }),
-        h('td', { text: c.net_io || '--' }),
-      ]))),
-    ])]),
-  ]);
-}
-
-function renderVm(data, node) {
-  const guest = (data.guests || {})[node.key];
-  const stage = $('stage');
-  stage.textContent = '';
-
+  const guest = (data.guests || {})[node.key] || {};
   const running = node.state === 'running';
-  stage.appendChild(h('div', { class: 'stage-head' }, [
-    h('h1', { class: 'stage-title', text: node.name }),
-    pill(node.state, running ? 'good'
-      : node.state === 'starting' || node.state === 'stopping' ? 'warning' : 'idle'),
-    h('span', { class: 'stage-note',
-      text: running || node.job ? '' : 'last seen ' + (node.last_seen
-        ? ago((Date.now() / 1000) - node.last_seen) : 'never') }),
-    h('div', { style: 'margin-left:auto' }, [
-      actionBar(node.key, node.state, node.job, node.name),
+  const address = ((data.host || {}).identity || {}).address || location.hostname;
+  const out = [];
+
+  out.push(h('div', {
+    'data-tx-pad': 'true',
+    style: 'display:flex;align-items:flex-end;justify-content:space-between;gap:24px;'
+         + 'flex-wrap:wrap;padding:24px 24px 16px;border-bottom:' + DIV,
+  }, [
+    h('div', { style: 'min-width:0' }, [
+      h('div', { style: 'display:flex;align-items:center;gap:12px;flex-wrap:wrap' }, [
+        h('h1', { style: 'margin:0;font-size:42px', text: node.name }),
+        stateTag(node.state, transitional(node.state) ? 'busy' : running ? 'up' : 'down'),
+      ]),
+      h('div', { class: 'text-muted', style: 'font-size:13px',
+                 text: (spec.arch || 'unknown') + ' under '
+                     + (spec.accel === 'tcg' ? 'full emulation' : spec.accel)
+                     + '. ' + (spec.cores || '?') + ' cores, '
+                     + bytes((spec.memory_mb || 0) * 1024 * 1024) + '.'
+                     + (running ? '' : ' Remembered but not running.') }),
+    ]),
+    h('div', { style: 'display:flex;gap:8px' },
+      actions(node.key, node.state, node.job, node.name)),
+  ]));
+
+  const strip = activity(node.job, node.state);
+  if (strip) out.push(strip);
+
+  out.push(h('div', {
+    style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:2px;'
+         + 'background:var(--color-divider);border-bottom:' + DIV,
+  }, [
+    tile('Emulator load', num(runtime.cpu_percent), '%', 'of one phone core'),
+    tile('Guest processor', guest.ok && guest.cpu ? num(guest.cpu.total) : '--', '%',
+         (spec.cores || '?') + ' virtual cores'),
+    tile('Guest memory', guest.ok && guest.memory ? num(guest.memory.percent) : '--', '%',
+         guest.ok && guest.memory
+           ? bytes(guest.memory.used) + ' of ' + bytes(guest.memory.total) : ''),
+    tile('Resident', bytes(runtime.rss), '', (runtime.threads || '--') + ' threads'),
+    tile('Uptime', duration(runtime.uptime), '',
+         node.boots ? node.boots + ' boots seen' : ''),
+  ]));
+
+  out.push(h('div', {
+    style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:2px;'
+         + 'background:var(--color-divider);border-bottom:' + DIV,
+  }, [
+    h('section', { style: 'background:var(--color-bg);padding:24px' }, [
+      h('h3', { style: 'margin:0 0 16px', text: 'Machine' }),
+      dl([
+        ['Architecture', spec.arch || 'unknown'],
+        ['Machine type', spec.machine || 'default'],
+        ['Processor model', spec.cpu || 'default'],
+        ['Acceleration', spec.accel === 'tcg' ? 'tcg · full emulation' : (spec.accel || '--')],
+        ['Console', spec.display || 'default'],
+        spec.cwd ? ['Started in', h('span', { style: 'font-family:ui-monospace,monospace;font-size:12px', text: spec.cwd })] : null,
+      ]),
+    ]),
+    h('section', { style: 'background:var(--color-bg);padding:24px' }, [
+      h('h3', { style: 'margin:0 0 16px', text: 'Ports' }),
+      (node.ports || []).length
+        ? h('div', { style: 'display:flex;flex-wrap:wrap;gap:6px' }, (node.ports || []).map((port) =>
+            h('span', {
+              class: 'tag ' + (port.open ? 'tag-accent' : 'tag-neutral'),
+              text: port.proto + ' ' + port.host_port + ' → ' + port.guest_port
+                  + (port.label ? ' · ' + port.label : '')
+                  + (port.proto === 'tcp' ? (port.open ? ' · open' : ' · closed') : ''),
+            })))
+        : h('div', { class: 'text-muted', style: 'font-size:12.5px',
+                     text: 'no forwards on the command line, so nothing on the phone reaches this guest' }),
+      (spec.disks || []).length
+        ? h('div', { style: 'margin-top:18px' }, (spec.disks || []).map((disk) => h('div', {
+            style: 'margin-bottom:12px',
+          }, [
+            h('div', {
+              style: 'display:flex;justify-content:space-between;font-size:12px;margin-bottom:5px',
+            }, [
+              h('span', { text: disk.name }),
+              h('span', { style: 'font-variant-numeric:tabular-nums',
+                          text: bytes(disk.allocated) + (disk.virtual ? ' of ' + bytes(disk.virtual) : '') }),
+            ]),
+            bar(disk.virtual ? disk.allocated / disk.virtual * 100 : 0, 'violet'),
+          ])))
+        : null,
     ]),
   ]));
 
-  const strip = activityStrip(node.job, node.state);
-  if (strip) stage.appendChild(strip);
-
-  stage.appendChild(vmTiles(node, guest));
-  if (running && (node.history || {}).cpu) stage.appendChild(vmTrendCard(node, guest));
-  stage.appendChild(h('div', { class: 'grid two' }, [specCard(node), portsCard(node)]));
-  const disks = disksCard(node);
-  stage.appendChild(h('div', { class: 'grid two' }, [guestCard(node, guest), disks].filter(Boolean)));
-  const containers = containersCard(guest);
-  if (containers) stage.appendChild(containers);
-  stage.appendChild(card('Command line', node.controllable
-    ? 'a monitor socket is exposed'
-    : 'no -qmp socket, so this machine cannot be controlled remotely yet', [
-    h('pre', { class: 'cmdline', text: node.cmdline || '--' }),
-  ]));
-}
-
-/* ----------------------------------------------------------------- rail */
-
-function renderRail(data) {
-  const rail = $('rail');
-  rail.textContent = '';
-  const host = data.host || {};
-  const id = host.identity || {};
-
-  rail.appendChild(h('div', { class: 'rail-heading', text: 'Host' }));
-  rail.appendChild(h('button', {
-    class: 'node', type: 'button', 'aria-current': state.selected === 'host',
-    onclick: () => select('host'),
-  }, [
-    h('span', { class: 'dot host' }),
-    h('span', { class: 'node-name', text: id.device || id.hostname || 'phone' }),
-    h('span', { class: 'node-metric', text: pct((host.cpu || {}).total) }),
-    h('span', { class: 'node-sub', text: (host.memory ? pct(host.memory.percent) + ' memory' : '') +
-      (host.battery && host.battery.available ? ' · ' + host.battery.percentage + '% battery' : '') }),
-  ]));
-
-  const nodes = data.nodes || [];
-  rail.appendChild(h('div', { class: 'rail-heading',
-    text: nodes.length ? 'Machines' : 'No machines found' }));
-  nodes.forEach((node) => {
-    const guest = (data.guests || {})[node.key] || {};
-    const runtime = node.runtime || {};
-    const guestLoad = guest.ok && guest.cpu ? guest.cpu.total : null;
-    const sub = node.state !== 'running'
-      ? 'stopped'
-      : guestLoad !== null && guestLoad !== undefined
-        ? pct(guestLoad) + ' guest load'
-        : (node.spec.cores || '?') + ' cores · ' +
-          (node.spec.memory_mb ? bytes(node.spec.memory_mb * 1024 * 1024) : '?');
-    rail.appendChild(h('button', {
-      class: 'node', type: 'button', 'aria-current': state.selected === node.key,
-      onclick: () => select(node.key),
+  if (guest.ok) {
+    out.push(h('div', {
+      style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:2px;'
+           + 'background:var(--color-divider);border-bottom:' + DIV,
     }, [
-      h('span', { class: 'dot ' + node.state }),
-      h('span', { class: 'node-name', text: node.name }),
-      h('span', { class: 'node-metric',
-        text: node.state === 'running' ? pct(runtime.cpu_percent) : '' }),
-      h('span', { class: 'node-sub', text: sub }),
+      h('section', { style: 'background:var(--color-bg);padding:24px' }, [
+        h('h3', { style: 'margin:0 0 16px', text: 'Inside the guest' }),
+        dl([
+          ['Hostname', guest.hostname || '--'],
+          ['System', guest.os || '--'],
+          ['Kernel', guest.kernel || '--'],
+          ['Uptime', duration(guest.uptime)],
+          ['Load', guest.load ? guest.load.map((v) => v.toFixed(2)).join(' · ') : '--'],
+        ]),
+        h('div', { style: 'margin-top:16px' }, (guest.filesystems || []).map((fs) => h('div', {
+          style: 'margin-bottom:12px',
+        }, [
+          h('div', { style: 'display:flex;justify-content:space-between;font-size:12px;margin-bottom:5px' }, [
+            h('span', { text: fs.mount }),
+            h('span', { style: 'font-variant-numeric:tabular-nums', text: bytes(fs.free) + ' free' }),
+          ]),
+          bar(fs.percent, 'teal'),
+        ]))),
+      ]),
+      h('section', { style: 'background:var(--color-bg);padding:24px' }, [
+        h('div', { style: 'display:flex;align-items:baseline;gap:12px;margin-bottom:16px' }, [
+          h('h3', { style: 'margin:0', text: 'Containers' }),
+          h('span', { class: 'text-muted', style: 'font-size:12px',
+                      text: (guest.docker || {}).age >= 0
+                        ? 'read ' + ago((guest.docker || {}).age) + ' · refreshed every '
+                          + Math.round(((guest.docker || {}).refresh || 0)) + 's'
+                        : 'first reading on the way' }),
+        ]),
+        ((guest.docker || {}).containers || []).length
+          ? h('div', { 'data-tx-bleed': 'true', style: 'overflow-x:auto;margin:0 -24px;padding:0 24px' }, [
+              h('table', { class: 'table', style: 'font-size:13px' }, [
+                h('thead', {}, [h('tr', {}, [
+                  h('th', { text: 'Name' }), h('th', { text: 'Image' }), h('th', { text: 'State' }),
+                  h('th', { style: 'text-align:right', text: 'Processor' }),
+                  h('th', { style: 'text-align:right', text: 'Memory' }),
+                ])]),
+                h('tbody', {}, (guest.docker.containers || []).map((c) => h('tr', {}, [
+                  h('td', { text: c.name }),
+                  h('td', { class: 'text-muted', text: c.image }),
+                  h('td', {}, [h('span', {
+                    class: 'tag ' + (c.state === 'running' ? 'tag-accent' : 'tag-neutral'),
+                    text: c.state,
+                  })]),
+                  h('td', { style: 'text-align:right;font-variant-numeric:tabular-nums',
+                            text: c.cpu_percent === null ? '--' : pct(c.cpu_percent, 1) }),
+                  h('td', { style: 'text-align:right;font-variant-numeric:tabular-nums',
+                            text: c.mem_used === null ? '--' : bytes(c.mem_used) }),
+                ]))),
+              ]),
+            ])
+          : h('div', { class: 'text-muted', style: 'font-size:12.5px',
+                       text: (guest.docker || {}).installed
+                         ? 'docker is installed; the first listing takes about twenty seconds under emulation'
+                         : 'no containers' }),
+      ]),
     ]));
-  });
-
-  if (!nodes.length) {
-    rail.appendChild(h('div', { class: 'later' }, [
-      'Start a qemu-system VM and it appears here on its own.',
+  } else if (running) {
+    out.push(h('section', { style: 'padding:24px;border-bottom:' + DIV }, [
+      sectionHead('Inside the guest', guest.reason || 'not sampled yet'),
     ]));
   }
 
-  const services = data.services || [];
-  if (services.length) {
-    rail.appendChild(h('div', { class: 'rail-heading', text: 'Services' }));
-    services.forEach((service) => {
-      const key = 'svc:' + service.id;
-      const metrics = service.metrics || {};
-      const runtime = service.runtime || {};
-      const rate = metrics.tokens_per_second || metrics.average_tps;
-      rail.appendChild(h('button', {
-        class: 'node', type: 'button', 'aria-current': state.selected === key,
-        onclick: () => select(key),
-      }, [
-        h('span', { class: 'dot ' + (service.state === 'running' ? 'running' : 'stopped') }),
-        h('span', { class: 'node-name', text: service.name }),
-        h('span', { class: 'node-metric',
-          text: service.state === 'running' ? pct(runtime.cpu_percent) : '' }),
-        h('span', { class: 'node-sub',
-          text: service.state !== 'running' ? service.state
-            : service.id === 'dns'
-              ? (service.dns_open ? 'resolving on ' + service.dns_port : 'port closed')
-                + ' · ' + bytes(runtime.rss)
-            : metrics.processing ? 'answering now'
-            : rate ? num(rate, 1) + ' tok/s · ' + bytes(runtime.rss) : bytes(runtime.rss) }),
-      ]));
-    });
+  out.push(h('div', {
+    style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:2px;'
+         + 'background:var(--color-divider);border-bottom:' + DIV,
+  }, [
+    h('section', { style: 'background:var(--color-bg);padding:24px' }, [
+      h('h3', { style: 'margin:0 0 16px', text: 'Command line' }),
+      h('pre', { class: 'tx-log', text: node.cmdline || '--' }),
+      h('div', { class: 'text-muted', style: 'font-size:12px;margin-top:12px',
+                 text: node.controllable
+                   ? 'a monitor socket is exposed'
+                   : 'no -qmp socket, so this machine cannot be driven from a console yet' }),
+    ]),
+    launcherPanel(node.key),
+  ]));
+
+  out.push(h('section', { style: 'padding:24px 24px 40px' }, [backButton()]));
+  return out;
+}
+
+/* ---------------------------------------------------------------- access */
+
+function renderAccess(data) {
+  const control = data.control || {};
+  const address = ((data.host || {}).identity || {}).address || location.hostname;
+  const out = [];
+
+  out.push(h('div', {
+    'data-tx-poster': 'true', style: 'background:var(--color-accent);padding:32px 24px',
+  }, [
+    h('h1', { style: 'margin:0;font-size:42px',
+              text: control.token_required
+                ? 'The panel refuses control without a token'
+                : 'Anyone on this network can stop your DNS' }),
+    h('div', { style: 'font-size:14px;max-width:70ch;margin-top:8px',
+               text: control.token_required
+                 ? 'Control endpoints check X-Termox-Token. The model servers are still open, '
+                   + 'because they answer to clients that cannot send a header.'
+                 : 'The dashboard binds 0.0.0.0:8080 with no authentication, and so do both '
+                   + 'model servers. Set a token and the control endpoints start refusing '
+                   + 'anything that does not carry it.' }),
+  ]));
+
+  out.push(h('div', {
+    style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:2px;'
+         + 'background:var(--color-divider);border-bottom:' + DIV,
+  }, [
+    h('section', { style: 'background:var(--color-bg);padding:24px' }, [
+      h('h3', { style: 'margin:0 0 12px', text: 'Set a token' }),
+      h('div', { class: 'text-muted', style: 'font-size:13px;margin-bottom:14px',
+                 text: 'The panel cannot write its own boot script, so this is the line to add. '
+                     + 'It survives the force-stop that installing a Termux add-on causes.' }),
+      h('pre', { class: 'tx-log',
+                 text: 'tmux new-session -d -s scope \\\n'
+                     + '  "cd ~/termox && TERMOX_TOKEN=' + suggestToken() + ' python3 -m termox"' }),
+      h('div', { style: 'display:flex;gap:8px;flex-wrap:wrap;margin-top:14px' }, [
+        h('button', {
+          type: 'button', class: 'btn btn-secondary', style: 'justify-content:flex-start',
+          onclick: () => { tokenSeed = null; render(); },
+        }, ['Suggest another']),
+      ]),
+    ]),
+    h('section', { style: 'background:var(--color-bg);padding:24px' }, [
+      h('h3', { style: 'margin:0 0 12px', text: 'Then reach it like this' }),
+      dl([
+        ['Browser', h('span', { style: 'font-family:ui-monospace,monospace;font-size:12px',
+          text: 'http://' + address + ':8080/?token=' + suggestToken() })],
+        ['Header', h('span', { style: 'font-family:ui-monospace,monospace;font-size:12px',
+          text: 'X-Termox-Token: ' + suggestToken() })],
+        ['Model servers', 'still open, keep them on the LAN or behind Tailscale'],
+        ['Now', control.token_required ? 'a token is required' : 'no token is required'],
+      ]),
+    ]),
+  ]));
+
+  out.push(h('section', { style: 'padding:24px 24px 40px' }, [backButton()]));
+  return out;
+}
+
+let tokenSeed = null;
+function suggestToken() {
+  if (!tokenSeed) {
+    const bytes16 = new Uint8Array(12);
+    crypto.getRandomValues(bytes16);
+    tokenSeed = Array.from(bytes16, (b) => 'abcdefghijkmnpqrstuvwxyz23456789'[b % 32]).join('');
   }
+  return tokenSeed;
 }
 
-/* --------------------------------------------------------------- render */
+/* ----------------------------------------------------------------- shell */
 
-function select(key) {
-  state.selected = key;
-  sessionStorage.setItem('termox.selected', key);
-  const url = new URL(location.href);
-  if (key === 'host') url.searchParams.delete('view');
-  else url.searchParams.set('view', key);
-  history.replaceState(null, '', url);
-  render();
-  $('stage').focus();
-}
+const root = document.getElementById('root');
 
 function render() {
   const data = state.data;
-  if (!data) return;
-  renderRail(data);
+  if (!data) {
+    root.textContent = '';
+    root.appendChild(h('div', {
+      'data-tx-theme': state.theme,
+      style: 'min-height:100vh;display:grid;place-items:center;background:var(--color-bg);'
+           + 'color:var(--color-text);font-family:var(--font-body)',
+    }, [h('span', { class: 'text-muted', text: 'reading the phone…' })]));
+    return;
+  }
 
-  const service = state.selected.startsWith('svc:')
-    ? (data.services || []).find((s) => 'svc:' + s.id === state.selected)
-    : null;
-  const node = (data.nodes || []).find((n) => n.key === state.selected);
-  if (service) renderService(data, service);
-  else if (state.selected === 'host' || !node) renderHost(data);
-  else renderVm(data, node);
+  const services = data.services || [];
+  const nodes = data.nodes || [];
+  let body;
+  if (state.view === 'host') body = renderHost(data);
+  else if (state.view === 'access') body = renderAccess(data);
+  else if (state.view.startsWith('svc:')) {
+    const service = services.find((s) => 'svc:' + s.id === state.view);
+    body = service ? renderService(data, service) : renderOverview(data);
+  } else if (state.view.startsWith('node:')) {
+    const key = state.view.slice(5);
+    const node = nodes.find((n) => n.key === key);
+    body = node ? renderNode(data, node) : renderOverview(data);
+  } else body = renderOverview(data);
 
-  const host = data.host || {};
-  const id = host.identity || {};
-  const meta = $('topbar-meta');
-  meta.textContent = '';
-  [
-    ['host', id.address || id.hostname || '--'],
-    ['up', duration(host.uptime)],
-    ['machines', (data.nodes || []).filter((n) => n.state === 'running').length +
-      ' / ' + (data.nodes || []).length],
-  ].forEach(([label, value]) => {
-    meta.appendChild(h('span', {}, [label + ' ', h('b', { text: value })]));
-  });
+  const shell = h('div', {
+    'data-tx-theme': state.theme,
+    'data-tx-narrow': state.narrow ? 'true' : null,
+    style: 'min-height:100vh;background:var(--color-bg);color:var(--color-text);'
+         + 'font-family:var(--font-body);font-size:15px;line-height:1.55',
+  }, [
+    header(data),
+    h('div', {
+      'data-tx-shell': 'true',
+      style: 'display:grid;grid-template-columns:262px minmax(0,1fr);align-items:start',
+    }, [
+      rail(data),
+      h('main', { tabindex: '-1', style: 'min-width:0' }, body),
+    ]),
+  ]);
+
+  root.textContent = '';
+  root.appendChild(shell);
+  root.appendChild(toastBox);
+  document.body.style.background = state.theme === 'dark' ? '#201e1d' : '#f3f2f2';
+  document.body.style.color = state.theme === 'dark' ? '#f8f4f4' : '#201e1d';
 }
 
-/* ----------------------------------------------------------------- poll */
+/* The design drives its narrow layout from a measured flag rather than a media
+   query, so the same rules hold in an embedded frame and on a real phone. */
+function measure() {
+  const narrow = root.clientWidth < 900;
+  if (narrow !== state.narrow) { state.narrow = narrow; render(); }
+}
+
+/* ------------------------------------------------------------------ poll */
 
 async function poll() {
   try {
@@ -1217,40 +1629,20 @@ async function poll() {
       cache: 'no-store',
     });
     if (!response.ok) throw new Error('HTTP ' + response.status);
-    state.data = await response.json();
-    announceJobs(state.data.jobs);
+    const fresh = await response.json();
+    state.data = fresh;
+    announceJobs(fresh.jobs);
     state.failures = 0;
-    document.body.classList.remove('stale-data');
-    $('pulse').classList.remove('stale');
-    $('banner').hidden = true;
     render();
   } catch (err) {
     state.failures += 1;
-    if (state.failures > 1) {
-      document.body.classList.add('stale-data');
-      $('pulse').classList.add('stale');
-      const banner = $('banner');
-      banner.textContent = 'lost the dashboard · retrying (' + state.failures + ')';
-      banner.hidden = false;
-    }
+    if (state.failures === 2) toast('bad', 'Lost the panel', 'retrying every two seconds');
+    if (state.data) render();
   }
 }
 
-/* ---------------------------------------------------------------- theme */
-
-function applyTheme(theme) {
-  if (theme) document.documentElement.setAttribute('data-theme', theme);
-  else document.documentElement.removeAttribute('data-theme');
-}
-
-$('theme').addEventListener('click', () => {
-  const current = localStorage.getItem('termox.theme');
-  const next = current === 'dark' ? 'light' : current === 'light' ? '' : 'dark';
-  if (next) localStorage.setItem('termox.theme', next);
-  else localStorage.removeItem('termox.theme');
-  applyTheme(next);
-});
-
-applyTheme(localStorage.getItem('termox.theme'));
+state.narrow = root.clientWidth < 900;
+new ResizeObserver(measure).observe(root);
+render();
 poll();
 setInterval(poll, POLL_MS);

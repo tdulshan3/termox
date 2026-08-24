@@ -236,22 +236,44 @@ The dashboard binds `0.0.0.0:8080` with **no authentication** — keep it on the
 LAN or behind Tailscale. Set `TERMOX_TOKEN` to require a token. The model
 servers are equally open.
 
+## The look
+
+The panel is built on **Modernist**, a design system from a Claude Design
+project: zero-radius surfaces, 2px dividers, Archivo throughout, one orange
+accent held back for alarms and primary actions, and a set of reading hues
+(blue, violet, teal, red, green) so a chart's identity comes from its subject
+rather than from rank. `termox/static/ds.css` is that system vendored, changed
+in exactly one way: the webfont is self-hosted, because the panel is served
+off a phone that may have no route to the internet and a fallback to system-ui
+would change the character of the type.
+
+Both grounds ship. The dark one reverses the neutral and accent ramps on their
+shared lightness scale so every step keeps its weight, and `?theme=light`
+carries a choice in a link.
+
 ## Screenshots
 
 The sidebar groups everything into **Host**, **Machines** and **Services**, and
 each gets its own page. Any page can be linked to directly with `?view=<key>`.
 
-**The phone.** Per-core load derived from idle residency, clustered by silicon
-tier, with the panels that cannot be read saying why.
+**Everything.** The default page: what wants attention, the readings across a
+window you pick, every machine and service with its controls, and where each
+one runs.
 
-![The host page](docs/img/host.png)
+![The overview](docs/img/host.png)
 
-The host page ends with **Where things run** — every tracked app with the
-binary and working directory it was actually started from, read from `/proc`
-rather than inferred from the launch scripts.
+**Light.** The same page on the system's paper ground.
+
+![Light ground](docs/img/light.png)
+
+The overview ends with **What talks to what** and **Where things run** — the
+architecture drawn from the ports actually configured, and every tracked app
+with the binary and working directory it was really started from, read from
+`/proc` rather than inferred from the launchers.
 
 **A model server.** Throughput, processor and graphics trends, the runtime it
-actually got, and the endpoints to point a client at.
+actually got, the endpoints to point a client at, the launcher's own output,
+and a box that sends one real request so the panel can show what it measured.
 
 ![A model server](docs/img/service.png)
 

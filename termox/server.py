@@ -12,14 +12,48 @@ import mimetypes
 import os
 import sys
 import threading
+import urllib.parse
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from . import control, host, vms
+from .series import Readings
 from .guestlink import GuestLink
 from .services import Services
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+
+def _bytes(value):
+    if not value:
+        return "nothing"
+    units = ["B", "KB", "MB", "GB", "TB"]
+    n, i = float(value), 0
+    while n >= 1024 and i < len(units) - 1:
+        n, i = n / 1024, i + 1
+    return "%.1f %s" % (n, units[i])
+
+
+def _query(raw):
+    """Percent-decode a query string. Values here carry colons and slashes --
+    a machine's key is its disk path -- so skipping the decode silently looks
+    up the wrong target."""
+    out = {}
+    for part in (raw or "").split("&"):
+        if not part:
+            continue
+        key, _, value = part.partition("=")
+        out[urllib.parse.unquote_plus(key)] = urllib.parse.unquote_plus(value)
+    return out
+
+
+def _ago(seconds):
+    seconds = int(seconds or 0)
+    if seconds < 60:
+        return "%ds ago" % seconds
+    if seconds < 3600:
+        return "%dm %ds ago" % (seconds // 60, seconds % 60)
+    return "%dh %dm ago" % (seconds // 3600, (seconds % 3600) // 60)
 STATIC = os.path.join(HERE, "static")
 
 PORT = int(os.environ.get("TERMOX_PORT", "8080"))
@@ -46,6 +80,8 @@ class State:
         self.guests = {}
         self.battery = {"available": False, "reason": "not sampled yet"}
         self.history = {"cpu": [], "memory": [], "rx": [], "tx": []}
+        self.readings = Readings()          # host readings at every window
+        self.service_readings = Readings()  # per-service, same treatment
         self.node_history = {}
         self.started = time.time()
         self.registry = vms.Registry()
@@ -98,6 +134,14 @@ class State:
             # GPU-backed service its load is that service's load
             series["gpu"].append(gpu.get("percent") if service.get("uses_gpu") else None)
             series["cpu"].append(runtime.get("cpu_percent"))
+            stamp = time.time()
+            self.service_readings.add("%s.rate" % service["id"],
+                                      metrics.get("tokens_per_second"), stamp)
+            self.service_readings.add("%s.cpu" % service["id"],
+                                      runtime.get("cpu_percent"), stamp)
+            if service.get("uses_gpu"):
+                self.service_readings.add("%s.gpu" % service["id"],
+                                          gpu.get("percent"), stamp)
             # the per-second gauge only refreshes when a request finishes, so
             # a live request would otherwise read as a hole in the trend
             series["rate"].append(metrics.get("tokens_per_second")
@@ -123,6 +167,59 @@ class State:
         if prefix and path.startswith(prefix):
             return "$PREFIX" + path[len(prefix):]
         return path
+
+    def alerts(self):
+        """Things worth interrupting for, derived from what was just sampled.
+
+        Deliberately few and deliberately specific: a panel that cries about
+        every busy core teaches you to ignore it.
+        """
+        found = []
+        snapshot = self.host or {}
+        cpu = snapshot.get("cpu") or {}
+
+        for core in cpu.get("cores") or []:
+            if core.get("percent") is not None and core["percent"] >= 99:
+                found.append({
+                    "title": "cpu%d pinned at %d%%" % (core["id"], core["percent"]),
+                    "detail": "A core is saturated. If the model servers are idle, "
+                              "something else is on it.",
+                })
+                break
+
+        memory = snapshot.get("memory") or {}
+        if (memory.get("percent") or 0) >= 90:
+            found.append({
+                "title": "memory at %.0f%%" % memory["percent"],
+                "detail": "%s available. Android starts killing background "
+                          "processes well before this runs out."
+                          % _bytes(memory.get("available")),
+            })
+
+        hottest = (snapshot.get("thermals") or [{}])[0]
+        if (hottest.get("celsius") or 0) >= 55:
+            found.append({
+                "title": "%s at %.1f °C" % (hottest.get("zone"), hottest["celsius"]),
+                "detail": "The driver throttles the big cores hard above this.",
+            })
+
+        for service in self.services:
+            if service.get("state") == "stopped":
+                found.append({
+                    "title": "%s is not running" % service["name"],
+                    "detail": "Start it from the panel, or from its launcher on "
+                              "the phone.",
+                })
+
+        for node in self.nodes:
+            if node.get("state") == "stopped" and node.get("last_seen"):
+                found.append({
+                    "title": "%s stopped %s" % (
+                        node["name"], _ago(time.time() - node["last_seen"])),
+                    "detail": "Remembered but not running. Anything inside it "
+                              "went with it.",
+                })
+        return found
 
     def paths(self):
         """Where every tracked app actually lives on disk.
@@ -194,6 +291,9 @@ class State:
                 "nodes": self.nodes,
                 "guests": self.guests,
                 "history": {k: list(v) for k, v in self.history.items()},
+                "readings": self.readings.payload(),
+                "serviceReadings": self.service_readings.payload(),
+                "alerts": self.alerts(),
                 "server": {"uptime": time.time() - self.started,
                            "version": "0.1.0"},
                 "served_at": time.time(),
@@ -280,8 +380,14 @@ def host_loop():
             "battery": battery,
             "limits": limits,
         }
+        gpu = snapshot.get("gpu") or {}
+        thermals = snapshot.get("thermals") or []
         with STATE.lock:
             STATE.host = snapshot
+            STATE.readings.add("cpu", percents.get("total"), now)
+            STATE.readings.add("memory", memory["percent"] if memory else None, now)
+            STATE.readings.add("gpu", gpu.get("percent") if gpu.get("available") else None, now)
+            STATE.readings.add("temp", thermals[0]["celsius"] if thermals else None, now)
             STATE.push_history(
                 percents.get("total"),
                 memory["percent"] if memory else None,
@@ -338,6 +444,35 @@ def guest_loop():
 
 
 # ------------------------------------------------------------------ http
+
+def launch_log(target):
+    """The tail of whatever the launcher printed the last time it started.
+
+    Only exists for things started from the panel: something brought up by
+    the boot script writes nowhere we can read, and saying so is better than
+    an empty box that looks like a bug.
+    """
+    spec = control.SERVICES.get(target[4:]) if target.startswith("svc:") else None
+    session = spec["session"] if spec else None
+    if not session:
+        with STATE.lock:
+            nodes = [n for n in STATE.nodes if n["key"] == target]
+        if nodes:
+            session, _ = control.node_launcher(nodes[0])
+    if not session:
+        return {"ok": False, "reason": "nothing controllable called %r" % target}
+
+    path = os.path.join(vms.TERMOX_HOME, "%s.launch.log" % session)
+    try:
+        with open(path) as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return {"ok": False, "session": session,
+                "reason": "no launcher output yet; it was last started outside "
+                          "the panel"}
+    return {"ok": True, "session": session, "lines": lines[-160:],
+            "truncated": len(lines) > 160}
+
 
 def control_spec(target):
     """Turn a UI target into something control.Jobs can act on."""
@@ -415,9 +550,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):                                  # noqa: N802 - stdlib API
         path, _, raw_query = self.path.partition("?")
-        query = dict(
-            part.split("=", 1) if "=" in part else (part, "")
-            for part in raw_query.split("&") if part)
+        query = _query(raw_query)
         if not self._authorised(query):
             return self._json({"error": "token required"}, 401)
         if path != "/api/control":
@@ -442,9 +575,7 @@ class Handler(BaseHTTPRequestHandler):
 
     def do_GET(self):                                   # noqa: N802 - stdlib API
         path, _, raw_query = self.path.partition("?")
-        query = dict(
-            part.split("=", 1) if "=" in part else (part, "")
-            for part in raw_query.split("&") if part)
+        query = _query(raw_query)
 
         if path.startswith("/api/") and not self._authorised(query):
             return self._json({"error": "token required"}, 401)
@@ -454,6 +585,8 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/api/host":
             with STATE.lock:
                 return self._json(STATE.host or {})
+        if path == "/api/launchlog":
+            return self._json(launch_log(query.get("target", "")))
         if path == "/api/jobs":
             return self._json({"jobs": STATE.jobs.listing()})
         if path == "/api/services":
@@ -469,8 +602,13 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"ok": True, "uptime": time.time() - STATE.started})
         if path in ("/", "/index.html"):
             return self._file("index.html")
+        # everything else that is not an API route is a static asset; the page
+        # links them relatively (ds.css, app.js, fonts/archivo.woff2) and the
+        # /static/ prefix is kept working for anything that still uses it
         if path.startswith("/static/"):
             return self._file(path[len("/static/"):])
+        if not path.startswith("/api/"):
+            return self._file(path.lstrip("/"))
         return self._send(404, b"not found", "text/plain")
 
     def _file(self, name):
