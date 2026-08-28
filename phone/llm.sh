@@ -69,6 +69,16 @@
 #
 # So: stock sampling, unchanged. The budget is the whole fix.
 #
+# Sizing the budget. Left to terminate on its own this model uses 331 tokens
+# for "17 * 23" and 402 for "12 * 15 + 37 * 4", so the budget has to clear ~400
+# or it severs a derivation before the final step. Measured: at 192 the chain
+# question answered "180" -- the first term alone, with both correct partials
+# already sitting in the reasoning block -- and 123*456 came back 56228, a
+# number appearing nowhere in its own working. 512 is the lowest value that
+# clears the observed ceiling with headroom. Higher is not better: at 2048 the
+# trivial prompts burn the whole budget and take ~2 minutes to say "red, blue,
+# green", because this model only loops when it has nothing to reason about.
+#
 # -c 32768 is also a safety limit, not just a capacity choice. A runaway can
 # only ever be as long as the context, and at 20-39 tok/s a 131072 context
 # meant a stuck request generated for about an hour before returning nothing.
@@ -78,7 +88,7 @@ exec llama-server \
   -m $HOME/models/Qwen3.5-0.8B-Q4_0.gguf \
   -t 4 -c 32768 --parallel 1 -b 256 --no-mmap \
   --reasoning on \
-  --reasoning-budget 2048 \
+  --reasoning-budget 512 \
   --reasoning-budget-message "$MSG" \
   --host 0.0.0.0 --port 8081 \
   --metrics \
