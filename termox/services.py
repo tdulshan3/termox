@@ -19,6 +19,7 @@ CPU_PORT = int(os.environ.get("TERMOX_LLM_CPU_PORT", "8081"))
 GPU_PORT = int(os.environ.get("TERMOX_LLM_GPU_PORT", "8082"))
 DNS_WEB_PORT = int(os.environ.get("TERMOX_DNS_WEB_PORT", "3000"))
 DNS_PORT = int(os.environ.get("TERMOX_DNS_PORT", "5300"))
+AUTOCLAIM_PORT = int(os.environ.get("TERMOX_AUTOCLAIM_PORT", "8787"))
 
 # Two model servers can run side by side: one on the CPU, one on the Adreno.
 # They are told apart by the port on their command line, because both are the
@@ -55,19 +56,40 @@ SERVICES = [
         # --port on the command line to match against
         "match_port": False,
     },
+    {
+        "id": "autoclaim",
+        "name": "AutoClaim",
+        "exe": "node",
+        "port": AUTOCLAIM_PORT,
+        "endpoint": "http://127.0.0.1:%d" % AUTOCLAIM_PORT,
+        "kind": "Node, native",
+        "uses_gpu": False,
+        # Its port comes from the environment, not the command line, so there is
+        # no --port to match. `node` alone is far too generic a name to identify
+        # a service by, so match the script it was given instead.
+        "match_port": False,
+        "argv_match": "server/index.js",
+    },
 ]
 
 
-def find_process(exe, port=None):
+def find_process(exe, port=None, argv_match=None):
     """The pid whose argv[0] basename matches, and whose --port is `port`.
 
     Matching argv[0] rather than searching the whole command line matters: a
     shell that merely mentions the name must not be mistaken for the service.
     The port check is what separates two instances of the same binary.
+
+    `argv_match` is the fallback for interpreters, where argv[0] names the
+    runtime and not the service: every node process is called `node`, so the
+    script path is the only thing that tells one from another. It is matched
+    against argv[1:] so it can never collide with the executable itself.
     """
     for pid in vms._pids():
         argv = vms._argv(pid)
         if not argv or os.path.basename(argv[0]) != exe:
+            continue
+        if argv_match and not any(argv_match in arg for arg in argv[1:]):
             continue
         if port is None:
             return pid, argv
@@ -131,11 +153,16 @@ class Services:
         }
 
         pid, argv = find_process(
-            spec["exe"], spec.get("port") if spec.get("match_port", True) else None)
+            spec["exe"],
+            spec.get("port") if spec.get("match_port", True) else None,
+            spec.get("argv_match"))
         if pid:
             entry["state"] = "running"
             entry["runtime"] = self._process(spec["id"], pid, interval)
             entry["model"] = _model_name(argv)
+
+        if spec["id"] == "autoclaim":
+            return _render_autoclaim(entry, spec)
 
         if spec["id"] == "dns":
             # AdGuard has no /health; its liveness is whether the resolver
@@ -305,6 +332,60 @@ def _render_dns(entry, spec):
             pass
     else:
         entry["dns_stats"] = None
+    return entry
+
+
+def _render_autoclaim(entry, spec):
+    """AutoClaim answers /api/status and nothing else useful.
+
+    It is not a model server, so the llama.cpp path -- /health, /props,
+    /v1/models, Prometheus -- would 404 four times per poll and then report the
+    service as "starting" forever. /api/status is both its liveness check and
+    the only interesting thing it has to say.
+
+    What matters for a glance is not that the process is up but whether it has
+    actually settled today: the scheduler ticks every five minutes and quietly
+    does nothing once every profile is done, so "claimed 1 of 3" is the number
+    that tells you something is wrong, not the uptime.
+    """
+    status = _fetch(spec["endpoint"] + "/api/status")
+    if status is None:
+        if entry["state"] == "running":
+            entry["state"] = "starting"      # process up, not yet serving
+        return entry
+    entry["state"] = "running"
+
+    try:
+        data = json.loads(status)
+    except ValueError:
+        return entry
+
+    scheduler = data.get("scheduler") or {}
+    profiles = data.get("profiles") or []
+    entry["claim_day"] = scheduler.get("today")
+    entry["claim_timezone"] = scheduler.get("timezone")
+    entry["claim_last_tick"] = scheduler.get("lastTickAt")
+
+    # `status` is an object, not a string. Its `settled` flag is the one that
+    # matters: it is true only when the account needed nothing further today,
+    # which is not the same as `done` -- an account with no game linked is done
+    # (the scheduler has stopped trying) but not settled (it earned nothing).
+    # A profile with auto-claim off is not counted against anything, because
+    # nobody asked it to claim.
+    wanted = [p for p in profiles if p.get("autoClaim")]
+    settled = [p for p in wanted if (p.get("status") or {}).get("settled")]
+    outcomes = {}
+    for p in wanted:
+        today = ((p.get("status") or {}).get("todayEntry") or {})
+        if today.get("outcome"):
+            outcomes[today["outcome"]] = outcomes.get(today["outcome"], 0) + 1
+    entry["claim_profiles"] = {
+        "total": len(profiles),
+        "auto": len(wanted),
+        "settled": len(settled),
+        "expired": len([p for p in wanted if not p.get("authOk")]),
+        "outcomes": outcomes,
+    }
     return entry
 
 
