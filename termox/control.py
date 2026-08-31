@@ -41,6 +41,13 @@ SERVICES = {
         "exe": "AdGuardHome", "match": None, "probe": 5300,
         "ready": "the resolver is answering queries",
     },
+    "autoclaim": {
+        "session": "autoclaim", "command": "~/autoclaim.sh",
+        # `node` names the runtime, not the service, so the script path is what
+        # identifies it -- see find_process in services.py.
+        "exe": "node", "match": "server/index.js", "probe": 8787,
+        "ready": "the scheduler is up and the API is answering",
+    },
 }
 
 LAUNCHERS_PATH = os.path.join(vms.TERMOX_HOME, "launchers.json")

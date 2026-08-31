@@ -597,6 +597,10 @@ function rail(data) {
     } else if (service.id === 'dns') {
       sub = [(service.dns_open ? 'resolving on ' + service.dns_port : 'port closed'),
              bytes(runtime.rss)].join(' · ');
+    } else if (service.id === 'autoclaim') {
+      const c = service.claim_profiles || {};
+      sub = [(c.auto ? c.settled + ' of ' + c.auto + ' claimed' : 'no profiles'),
+             bytes(runtime.rss)].filter(Boolean).join(' · ');
     } else {
       const rate = metrics.tokens_per_second || metrics.average_tps;
       sub = [rate ? num(rate, 1) + ' tok/s' : 'no requests yet',
@@ -917,6 +921,13 @@ function serviceCard(service) {
           ['Resident', bytes(runtime.rss)],
           ['Uptime', duration(runtime.uptime)],
         ])
+      : service.id === 'autoclaim'
+      ? dl([
+          ['Claimed today', claimSummary(service)],
+          ['Day', (service.claim_day || '--')
+                  + (service.claim_timezone ? ' · ' + service.claim_timezone : '')],
+          ['Resident', bytes(runtime.rss)],
+        ])
       : dl([
           ['Generation', rate ? num(rate, 1) + ' tok/s' : 'no requests yet'],
           ['Served', num(metrics.tokens_total) + ' tokens'],
@@ -926,6 +937,37 @@ function serviceCard(service) {
       actions('svc:' + service.id, service.state, service.job, service.name)),
   ]);
 }
+
+function claimTrouble(service) {
+  const o = (service.claim_profiles || {}).outcomes || {};
+  return Object.keys(o)
+    .filter((k) => k !== 'claimed' && k !== 'already')
+    .reduce((n, k) => n + o[k], 0);
+}
+
+
+function claimTroubleNote(service) {
+  const o = (service.claim_profiles || {}).outcomes || {};
+  const bad = Object.keys(o).filter((k) => k !== 'claimed' && k !== 'already');
+  if (!bad.length) return 'every profile settled';
+  return bad.map((k) => o[k] + ' ' + k).join(' · ');
+}
+
+
+function claimSummary(service) {
+  // "1 of 3" is the honest headline. An account whose game is not linked is
+  // finished for the day but has earned nothing, so counting "done" would show
+  // 3 of 3 while two of them quietly collect nothing.
+  const c = service.claim_profiles || {};
+  if (!c.auto) return 'no profiles set to auto-claim';
+  const parts = [c.settled + ' of ' + c.auto];
+  const trouble = Object.keys(c.outcomes || {})
+    .filter((k) => k !== 'claimed' && k !== 'already')
+    .map((k) => c.outcomes[k] + ' ' + k);
+  if (trouble.length) parts.push(trouble.join(', '));
+  return parts.join(' · ');
+}
+
 
 function pathsSection(data) {
   const rows = data.paths || [];
@@ -1219,6 +1261,10 @@ function renderService(data, service) {
   const target = 'svc:' + service.id;
   const running = service.state === 'running';
   const isDns = service.id === 'dns';
+  const isClaim = service.id === 'autoclaim';
+  // Only the model servers get the llama.cpp treatment: throughput tiles,
+  // generation-rate charts, /metrics endpoints. The other two have none of it.
+  const isModel = !isDns && !isClaim;
   const out = [];
 
   out.push(h('div', {
@@ -1235,6 +1281,10 @@ function renderService(data, service) {
                  text: isDns
                    ? 'AdGuard Home, built for this phone and running natively. '
                      + 'Port 53 needs root, so it answers on ' + (service.dns_port || 5300) + '.'
+                   : isClaim
+                   ? 'Claims the daily attendance points on xm100.vn. Bound to loopback '
+                     + 'on purpose: it holds live session cookies, so reach it through an '
+                     + 'SSH tunnel rather than opening the port.'
                    : (service.kind || '') + '. '
                      + (service.model ? service.model.split('/').pop() : 'no model loaded')
                      + (service.context ? ', ' + num(service.context) + ' tokens of context' : '') }),
@@ -1254,6 +1304,14 @@ function renderService(data, service) {
     tile('Processor', num(runtime.cpu_percent), '%', 'of one phone core'),
     tile('Resident', bytes(runtime.rss), '', (runtime.threads || '--') + ' threads'),
     tile('Uptime', duration(runtime.uptime), '', 'pid ' + (runtime.pid || '--')),
+  ] : isClaim ? [
+    tile('Claimed today', String((service.claim_profiles || {}).settled ?? '--'),
+         ' of ' + ((service.claim_profiles || {}).auto ?? '--'), 'profiles set to auto-claim'),
+    tile('Needs a look', String(claimTrouble(service)), '',
+         claimTroubleNote(service)),
+    tile('Day', service.claim_day || '--', '', service.claim_timezone || ''),
+    tile('Resident', bytes(runtime.rss), '', 'pid ' + (runtime.pid || '--')),
+    tile('Uptime', duration(runtime.uptime), '', 'scheduler ticks every 5 min'),
   ] : [
     tile('Generation', num(metrics.tokens_per_second || metrics.average_tps, 1), ' tok/s',
          metrics.tokens_per_second ? 'last request' : 'average since start'),
@@ -1269,7 +1327,7 @@ function renderService(data, service) {
          metrics.processing ? num(metrics.processing) + ' in flight' : 'idle'),
   ].filter(Boolean)));
 
-  if (!isDns) {
+  if (isModel) {
     const rate = serviceReading(service.id, 'rate');
     const proc = serviceReading(service.id, 'cpu');
     const gpuSeries = serviceReading(service.id, 'gpu');
@@ -1302,6 +1360,16 @@ function renderService(data, service) {
                           target: '_blank', rel: 'noreferrer',
                           text: (service.endpoint || '').replace('127.0.0.1', address) })],
        ['Status', service.dns_open ? 'answering queries' : 'not answering']]
+    : isClaim
+    ? [['On the phone', h('span', { style: 'font-family:ui-monospace,monospace',
+        text: service.endpoint || '' })],
+       // Deliberately not linkified: the address is only reachable from the
+       // phone itself, so a link from this browser would just fail.
+       ['Reach it', h('span', { style: 'font-family:ui-monospace,monospace',
+        text: 'ssh -p 8022 -L 8787:127.0.0.1:8787 ' + address })],
+       ['Last tick', service.claim_last_tick
+          ? new Date(service.claim_last_tick).toLocaleTimeString() : 'not yet'],
+       ['Today', claimSummary(service)]]
     : [['OpenAI-compatible', h('span', { style: 'font-family:ui-monospace,monospace',
         text: (service.endpoint || '').replace('127.0.0.1', address) + '/v1' })],
        ['Native', h('span', { style: 'font-family:ui-monospace,monospace',
@@ -1315,7 +1383,8 @@ function renderService(data, service) {
          + 'background:var(--color-divider);border-bottom:' + DIV,
   }, [
     h('section', { style: 'background:var(--color-bg);padding:24px' }, [
-      h('h3', { style: 'margin:0 0 16px', text: isDns ? 'Resolver' : 'Endpoints' }),
+      h('h3', { style: 'margin:0 0 16px',
+                text: isDns ? 'Resolver' : isClaim ? 'Reaching it' : 'Endpoints' }),
       isDns
         ? h('div', { style: 'margin-bottom:16px' }, [
             h('a', { class: 'btn btn-primary', style: 'justify-content:flex-start',
@@ -1328,13 +1397,17 @@ function renderService(data, service) {
                  text: isDns
                    ? 'Query and block counts live behind the AdGuard login, so they are shown '
                      + 'in the admin rather than here.'
+                   : isClaim
+                   ? 'This one is not published to the LAN. It holds live session cookies and '
+                     + 'has no login of its own, so anything that could reach the port would '
+                     + 'own the accounts. Tunnel it instead.'
                    : 'No API key is checked. Point Page Assist or any OpenAI-compatible client '
                      + 'at the /v1 URL and keep it on the LAN.' }),
     ]),
     launcherPanel(target),
   ]));
 
-  if (!isDns && running) out.push(tryItPanel(service));
+  if (isModel && running) out.push(tryItPanel(service));
 
   out.push(h('section', { style: 'padding:24px 24px 40px' }, [backButton()]));
   return out;
