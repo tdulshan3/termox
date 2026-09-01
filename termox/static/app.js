@@ -933,8 +933,9 @@ function serviceCard(service) {
           ['Served', num(metrics.tokens_total) + ' tokens'],
           ['Resident', bytes(runtime.rss)],
         ]),
-    h('div', { style: 'display:flex;gap:8px;margin-top:auto' },
-      actions('svc:' + service.id, service.state, service.job, service.name)),
+    h('div', { style: 'display:flex;gap:8px;margin-top:auto;flex-wrap:wrap' },
+      actions('svc:' + service.id, service.state, service.job, service.name)
+        .concat(service.id === 'autoclaim' && running ? [openAutoclaim('Open')] : [])),
   ]);
 }
 
@@ -953,6 +954,21 @@ function claimTroubleNote(service) {
   return bad.map((k) => o[k] + ' ' + k).join(' · ');
 }
 
+
+// The dashboard proxies AutoClaim at this path (see _proxy_autoclaim in
+// server.py). It is a same-origin link on purpose: the app's own address is
+// loopback-only on the phone, so a direct link would resolve to whatever
+// machine the browser is running on and fail.
+const AUTOCLAIM_PATH = '/autoclaim/';
+
+function openAutoclaim(label, kind) {
+  return h('a', {
+    class: 'btn btn-' + (kind || 'secondary'),
+    style: 'justify-content:flex-start',
+    href: AUTOCLAIM_PATH, target: '_blank', rel: 'noreferrer',
+    text: label || 'Open',
+  });
+}
 
 function claimSummary(service) {
   // "1 of 3" is the honest headline. An account whose game is not linked is
@@ -1283,8 +1299,8 @@ function renderService(data, service) {
                      + 'Port 53 needs root, so it answers on ' + (service.dns_port || 5300) + '.'
                    : isClaim
                    ? 'Claims the daily attendance points on xm100.vn. Bound to loopback '
-                     + 'on purpose: it holds live session cookies, so reach it through an '
-                     + 'SSH tunnel rather than opening the port.'
+                     + 'on purpose: it holds live session cookies. Open it with the button '
+                     + 'below, which goes through this panel rather than the open port.'
                    : (service.kind || '') + '. '
                      + (service.model ? service.model.split('/').pop() : 'no model loaded')
                      + (service.context ? ', ' + num(service.context) + ' tokens of context' : '') }),
@@ -1363,10 +1379,11 @@ function renderService(data, service) {
     : isClaim
     ? [['On the phone', h('span', { style: 'font-family:ui-monospace,monospace',
         text: service.endpoint || '' })],
-       // Deliberately not linkified: the address is only reachable from the
-       // phone itself, so a link from this browser would just fail.
-       ['Reach it', h('span', { style: 'font-family:ui-monospace,monospace',
-        text: 'ssh -p 8022 -L 8787:127.0.0.1:8787 ' + address })],
+       // That address is loopback-only, so it is shown rather than linked.
+       // The way in from any other machine is this dashboard, which proxies it.
+       ['Through this panel', h('a', { href: AUTOCLAIM_PATH, target: '_blank',
+        rel: 'noreferrer', style: 'font-family:ui-monospace,monospace',
+        text: location.origin + AUTOCLAIM_PATH })],
        ['Last tick', service.claim_last_tick
           ? new Date(service.claim_last_tick).toLocaleTimeString() : 'not yet'],
        ['Today', claimSummary(service)]]
@@ -1391,6 +1408,8 @@ function renderService(data, service) {
                      href: (service.endpoint || '').replace('127.0.0.1', address),
                      target: '_blank', rel: 'noreferrer', text: 'Open the AdGuard admin' }),
           ])
+        : isClaim && running
+        ? h('div', { style: 'margin-bottom:16px' }, [openAutoclaim('Open AutoClaim', 'primary')])
         : null,
       dl(endpointRows.filter(Boolean)),
       h('div', { class: 'text-muted', style: 'font-size:12px;margin-top:12px',
@@ -1398,9 +1417,10 @@ function renderService(data, service) {
                    ? 'Query and block counts live behind the AdGuard login, so they are shown '
                      + 'in the admin rather than here.'
                    : isClaim
-                   ? 'This one is not published to the LAN. It holds live session cookies and '
-                     + 'has no login of its own, so anything that could reach the port would '
-                     + 'own the accounts. Tunnel it instead.'
+                   ? 'Still not published to the LAN: it binds to loopback and has no login of '
+                     + 'its own, so anything that could reach the port would own the accounts. '
+                     + 'This panel proxies it instead, which means whoever can open the dashboard '
+                     + 'can also drive it.'
                    : 'No API key is checked. Point Page Assist or any OpenAI-compatible client '
                      + 'at the /v1 URL and keep it on the LAN.' }),
     ]),
