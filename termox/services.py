@@ -7,6 +7,8 @@ when it is busy everything else on the phone feels it. Process facts come from
 the only place the token rates actually exist.
 """
 
+import calendar
+import datetime
 import json
 import os
 import time
@@ -386,7 +388,83 @@ def _render_autoclaim(entry, spec):
         "expired": len([p for p in wanted if not p.get("authOk")]),
         "outcomes": outcomes,
     }
+    entry["claim_rewards"] = _rewards(wanted, scheduler.get("today"))
     return entry
+
+
+def _streak(claimed, today):
+    """Consecutive claimed days ending today.
+
+    Today not being claimed *yet* does not break a streak -- it just does not
+    extend it -- so a day that is still in progress counts back from yesterday.
+    """
+    have = set(claimed or ())
+    if not have or not today:
+        return 0
+    try:
+        cursor = datetime.date.fromisoformat(today)
+    except ValueError:
+        return 0
+    if cursor.isoformat() not in have:
+        cursor -= datetime.timedelta(days=1)
+    count = 0
+    while cursor.isoformat() in have:
+        count += 1
+        cursor -= datetime.timedelta(days=1)
+    return count
+
+
+def _rewards(wanted, today):
+    """The two rewards that are not the daily check-in.
+
+    Compensation is the one worth interrupting for: it is a fixed award that
+    expires, so an unclaimed one is a deadline rather than a status. The month
+    is context -- the whole-month bonus is granted by the daily claim itself,
+    so there is nothing to press here, only progress to show.
+    """
+    days_in_month = None
+    if today:
+        try:
+            year, month, _ = (int(part) for part in today.split("-"))
+            days_in_month = calendar.monthrange(year, month)[1]
+        except (ValueError, TypeError):
+            days_in_month = None
+
+    rows, pending, amount, date, expires = [], 0, None, None, None
+    for profile in wanted:
+        snapshot = (profile.get("status") or {}).get("rewards") or {}
+        attendance = snapshot.get("attendance") or {}
+        maintenance = snapshot.get("maintenance") or {}
+
+        claimed = attendance.get("claimedDates") or []
+        rows.append({
+            "name": profile.get("name") or profile.get("label"),
+            "claimed": len(claimed) if attendance else None,
+            "streak": _streak(claimed, today) if attendance else None,
+            "bonus": bool(attendance.get("bonusClaimed")) if attendance else None,
+            "per_day": attendance.get("rewardAmount") if attendance else None,
+        })
+
+        if maintenance.get("canClaim"):
+            pending += 1
+            amount = maintenance.get("amount") or amount
+            date = maintenance.get("date") or date
+            # The soonest deadline is the one that matters when several are open.
+            offer_expiry = maintenance.get("expiryDate")
+            if offer_expiry and (expires is None or offer_expiry < expires):
+                expires = offer_expiry
+
+    return {
+        "month": today[:7] if today else None,
+        "days_in_month": days_in_month,
+        "profiles": rows,
+        "compensation": {
+            "pending": pending,
+            "amount": amount,
+            "date": date,
+            "expires": expires,
+        },
+    }
 
 
 def _model_name(argv):

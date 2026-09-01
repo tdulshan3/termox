@@ -220,6 +220,25 @@ class State:
                               "the phone.",
                 })
 
+            # A rejected cookie is the one thing here a human has to fix, and it
+            # is not self-correcting: it stops the daily claim and it stops
+            # compensation being taken before the offer expires. Everything else
+            # AutoClaim runs into is retried on the next tick.
+            expired = (service.get("claim_profiles") or {}).get("expired") or 0
+            if expired:
+                comp = ((service.get("claim_rewards") or {})
+                        .get("compensation") or {})
+                detail = ("Paste a fresh connect.sid in AutoClaim; nothing is "
+                          "claimed for that account until you do.")
+                if comp.get("pending") and comp.get("expires"):
+                    detail += (" Compensation is waiting and expires %s."
+                               % comp["expires"])
+                found.append({
+                    "title": "%d AutoClaim session%s expired"
+                             % (expired, "" if expired == 1 else "s"),
+                    "detail": detail,
+                })
+
         for node in self.nodes:
             if node.get("state") == "stopped" and node.get("last_seen"):
                 found.append({
