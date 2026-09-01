@@ -7,6 +7,7 @@ never stalls a page load. Handlers only ever read the last snapshot.
 Stdlib only.
 """
 
+import http.client
 import json
 import mimetypes
 import os
@@ -57,6 +58,14 @@ def _ago(seconds):
 STATIC = os.path.join(HERE, "static")
 
 PORT = int(os.environ.get("TERMOX_PORT", "8080"))
+AUTOCLAIM_PORT = int(os.environ.get("TERMOX_AUTOCLAIM_PORT", "8787"))
+
+# AutoClaim binds to loopback on purpose - it holds live session cookies and
+# has no login of its own. Proxying it here rather than widening that bind
+# means it stays unreachable except through this dashboard, and a browser on
+# any device can open it without a tunnel. Its own /assets and /api paths are
+# relative to the document, so the prefix survives a page load.
+AUTOCLAIM_PREFIX = "/autoclaim"
 BIND = os.environ.get("TERMOX_BIND", "0.0.0.0")
 TOKEN = os.environ.get("TERMOX_TOKEN") or None
 
@@ -548,11 +557,32 @@ class Handler(BaseHTTPRequestHandler):
             return True
         return query.get("token") == TOKEN
 
+    def _autoclaim_route(self):
+        """True when this request belongs to the proxied app."""
+        path = self.path.partition("?")[0]
+        return path == AUTOCLAIM_PREFIX or path.startswith(AUTOCLAIM_PREFIX + "/")
+
+    def do_PATCH(self):                                 # noqa: N802 - stdlib API
+        if not self._autoclaim_route():
+            return self._send(404, b"not found", "text/plain")
+        if not self._authorised(_query(self.path.partition("?")[2])):
+            return self._json({"error": "token required"}, 401)
+        self._proxy_autoclaim("PATCH")
+
+    def do_DELETE(self):                                # noqa: N802 - stdlib API
+        if not self._autoclaim_route():
+            return self._send(404, b"not found", "text/plain")
+        if not self._authorised(_query(self.path.partition("?")[2])):
+            return self._json({"error": "token required"}, 401)
+        self._proxy_autoclaim("DELETE")
+
     def do_POST(self):                                  # noqa: N802 - stdlib API
         path, _, raw_query = self.path.partition("?")
         query = _query(raw_query)
         if not self._authorised(query):
             return self._json({"error": "token required"}, 401)
+        if self._autoclaim_route():
+            return self._proxy_autoclaim("POST")
         if path != "/api/control":
             return self._send(404, b"not found", "text/plain")
 
@@ -577,8 +607,12 @@ class Handler(BaseHTTPRequestHandler):
         path, _, raw_query = self.path.partition("?")
         query = _query(raw_query)
 
-        if path.startswith("/api/") and not self._authorised(query):
+        if (path.startswith("/api/") or self._autoclaim_route()) \
+                and not self._authorised(query):
             return self._json({"error": "token required"}, 401)
+
+        if self._autoclaim_route():
+            return self._proxy_autoclaim("GET")
 
         if path == "/api/state":
             return self._json(STATE.snapshot())
@@ -621,6 +655,71 @@ class Handler(BaseHTTPRequestHandler):
             ctype += "; charset=utf-8"
         with open(full, "rb") as fh:
             self._send(200, fh.read(), ctype)
+
+    def _proxy_autoclaim(self, method):
+        """Forward one request to AutoClaim on loopback and stream the reply.
+
+        Streaming matters: the app pushes updates over SSE, and reading the
+        whole body before answering would hold every event until the stream
+        closed, which it never does.
+        """
+        target = self.path[len(AUTOCLAIM_PREFIX):]
+        if not target:
+            # Relative asset URLs only resolve correctly from a directory URL.
+            self.send_response(301)
+            self.send_header("Location", AUTOCLAIM_PREFIX + "/")
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+
+        body = None
+        length = int(self.headers.get("Content-Length") or 0)
+        if length:
+            body = self.rfile.read(length)
+
+        headers = {}
+        for name in ("Content-Type", "Accept", "Cache-Control"):
+            if self.headers.get(name):
+                headers[name] = self.headers[name]
+
+        # No timeout on the read: an SSE response is meant to stay open.
+        conn = http.client.HTTPConnection("127.0.0.1", AUTOCLAIM_PORT, timeout=None)
+        try:
+            conn.request(method, target, body=body, headers=headers)
+            upstream = conn.getresponse()
+        except OSError as exc:
+            conn.close()
+            return self._send(502, ("AutoClaim is not answering on 127.0.0.1:%d (%s)"
+                                    % (AUTOCLAIM_PORT, exc)).encode(), "text/plain")
+
+        ctype = upstream.getheader("Content-Type", "application/octet-stream")
+        try:
+            if "text/event-stream" in ctype:
+                self.send_response(upstream.status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Cache-Control", "no-cache, no-transform")
+                # Close-delimited: the length is unknown and never ends.
+                self.send_header("Connection", "close")
+                self.close_connection = True
+                self.end_headers()
+                while True:
+                    line = upstream.readline()
+                    if not line:
+                        break
+                    self.wfile.write(line)
+                    self.wfile.flush()
+            else:
+                data = upstream.read()
+                self.send_response(upstream.status)
+                self.send_header("Content-Type", ctype)
+                self.send_header("Content-Length", str(len(data)))
+                self.send_header("Cache-Control", "no-store")
+                self.end_headers()
+                self.wfile.write(data)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            pass                       # the tab was closed mid-stream
+        finally:
+            conn.close()
 
     def log_message(self, fmt, *args):
         pass
