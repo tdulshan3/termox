@@ -599,7 +599,9 @@ function rail(data) {
              bytes(runtime.rss)].join(' · ');
     } else if (service.id === 'autoclaim') {
       const c = service.claim_profiles || {};
+      const waiting = compensationPending(service);
       sub = [(c.auto ? c.settled + ' of ' + c.auto + ' claimed' : 'no profiles'),
+             waiting ? waiting + ' compensation waiting' : null,
              bytes(runtime.rss)].filter(Boolean).join(' · ');
     } else {
       const rate = metrics.tokens_per_second || metrics.average_tps;
@@ -924,9 +926,10 @@ function serviceCard(service) {
       : service.id === 'autoclaim'
       ? dl([
           ['Claimed today', claimSummary(service)],
+          ['This month', monthSummary(service)],
+          ['Compensation', compensationSummary(service)],
           ['Day', (service.claim_day || '--')
                   + (service.claim_timezone ? ' · ' + service.claim_timezone : '')],
-          ['Resident', bytes(runtime.rss)],
         ])
       : dl([
           ['Generation', rate ? num(rate, 1) + ' tok/s' : 'no requests yet'],
@@ -968,6 +971,79 @@ function openAutoclaim(label, kind) {
     href: AUTOCLAIM_PATH, target: '_blank', rel: 'noreferrer',
     text: label || 'Open',
   });
+}
+
+function compensationPending(service) {
+  return (((service.claim_rewards || {}).compensation) || {}).pending || 0;
+}
+
+/**
+ * Downtime compensation is a fixed award that expires, so an unclaimed one is
+ * a deadline rather than a status. AutoClaim takes it on the next tick, which
+ * means seeing one here usually just means the tick has not come round yet -
+ * unless the session is dead, and the alert covers that.
+ */
+function compensationSummary(service) {
+  const c = ((service.claim_rewards || {}).compensation) || {};
+  if (!c.pending) {
+    return c.date ? 'nothing waiting · last offer ' + c.date : 'nothing waiting';
+  }
+  return [c.pending + (c.pending === 1 ? ' account' : ' accounts'),
+          c.amount ? num(c.amount) + ' pts each' : null,
+          c.expires ? 'expires ' + c.expires : null].filter(Boolean).join(' · ');
+}
+
+function compensationHeadline(service) {
+  const c = ((service.claim_rewards || {}).compensation) || {};
+  return c.pending ? String(c.pending) : 'none';
+}
+
+function compensationNote(service) {
+  const c = ((service.claim_rewards || {}).compensation) || {};
+  if (!c.pending) return c.date ? 'last offer ' + c.date : 'nothing on offer';
+  return (c.amount ? num(c.amount) + ' pts each' : 'waiting')
+       + (c.expires ? ' · expires ' + c.expires : '');
+}
+
+/**
+ * The month is context, not a button: the whole-month bonus is granted by the
+ * daily claim that completes the month, so there is nothing to press. The
+ * weakest account is the one shown, because it is the one that will miss it.
+ */
+function monthRows(service) {
+  return ((service.claim_rewards || {}).profiles || [])
+    .filter((p) => p.claimed !== null && p.claimed !== undefined);
+}
+
+function monthSummary(service) {
+  const rows = monthRows(service);
+  const total = (service.claim_rewards || {}).days_in_month;
+  if (!rows.length) return 'not read yet';
+  return rows.map((p) => p.name + ' ' + p.claimed + (total ? '/' + total : '')
+                         + (p.streak ? ' · ' + p.streak + 'd streak' : '')
+                         + (p.bonus ? ' · bonus in' : ''))
+             .join(' · ');
+}
+
+function monthHeadline(service) {
+  const rows = monthRows(service);
+  if (!rows.length) return '--';
+  return String(Math.min.apply(null, rows.map((p) => p.claimed)));
+}
+
+function monthHeadlineUnit(service) {
+  const total = (service.claim_rewards || {}).days_in_month;
+  return total ? ' of ' + total : '';
+}
+
+function monthNote(service) {
+  const rows = monthRows(service);
+  if (!rows.length) return 'the month has not been read yet';
+  const done = rows.filter((p) => p.bonus).length;
+  const streak = Math.min.apply(null, rows.map((p) => p.streak || 0));
+  if (done === rows.length) return 'month bonus claimed';
+  return streak + (streak === 1 ? ' day streak' : ' day streak')
+       + ' · bonus at ' + ((service.claim_rewards || {}).days_in_month || '--') + ' days';
 }
 
 function claimSummary(service) {
@@ -1298,8 +1374,9 @@ function renderService(data, service) {
                    ? 'AdGuard Home, built for this phone and running natively. '
                      + 'Port 53 needs root, so it answers on ' + (service.dns_port || 5300) + '.'
                    : isClaim
-                   ? 'Claims the daily attendance points on xm100.vn. Bound to loopback '
-                     + 'on purpose: it holds live session cookies. Open it with the button '
+                   ? 'Claims the daily attendance points on xm100.vn, and downtime '
+                     + 'compensation when the server offers it. Bound to loopback on '
+                     + 'purpose: it holds live session cookies. Open it with the button '
                      + 'below, which goes through this panel rather than the open port.'
                    : (service.kind || '') + '. '
                      + (service.model ? service.model.split('/').pop() : 'no model loaded')
@@ -1325,8 +1402,11 @@ function renderService(data, service) {
          ' of ' + ((service.claim_profiles || {}).auto ?? '--'), 'profiles set to auto-claim'),
     tile('Needs a look', String(claimTrouble(service)), '',
          claimTroubleNote(service)),
+    tile('This month', monthHeadline(service), monthHeadlineUnit(service),
+         monthNote(service)),
+    tile('Compensation', compensationHeadline(service), '',
+         compensationNote(service)),
     tile('Day', service.claim_day || '--', '', service.claim_timezone || ''),
-    tile('Resident', bytes(runtime.rss), '', 'pid ' + (runtime.pid || '--')),
     tile('Uptime', duration(runtime.uptime), '', 'scheduler ticks every 5 min'),
   ] : [
     tile('Generation', num(metrics.tokens_per_second || metrics.average_tps, 1), ' tok/s',
