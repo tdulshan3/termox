@@ -6,8 +6,8 @@ A control panel for everything running on a phone. It runs **in Termux on the
 phone itself** and answers on the LAN, so a browser anywhere in the house shows
 what the device, its virtual machines and its model servers are doing.
 
-Built for a Galaxy S20 (Snapdragon 865) running AdGuard Home and two local LLM
-servers, all natively -- no VM, no container, no root.
+Built for a Galaxy S20 (Snapdragon 865) running AdGuard Home, Immich and two
+local LLM servers, all natively -- no VM, no container, no root.
 
 ```
 browser  →  phone:8080   termox        (Termux, native, stdlib only)
@@ -16,6 +16,7 @@ browser  →  phone:8080   termox        (Termux, native, stdlib only)
                 ├─ :8081 /metrics      model server on the CPU
                 ├─ :8082 /metrics      model server on the GPU
                 ├─ :3000 /control      AdGuard Home
+                ├─ :2283 /api/server   Immich, with PostgreSQL and Valkey behind it
                 └─ ssh 127.0.0.1:2222  inside each guest (when one exists)
 ```
 
@@ -142,6 +143,91 @@ in the way, and the order they appeared in matters:
 Port 53 still cannot be bound without root, so DNS answers on **5300** -- the
 same port the VM used to forward, so no client needed reconfiguring.
 
+### Immich runs natively, once three things are built by hand
+
+Immich is a Node server, PostgreSQL with a vector index, a Redis-shaped queue
+and an optional Python model server. All but the last go on the phone;
+`phone/immich/install.sh` does it, and each of these cost a failed run:
+
+- **Termux's `postgresql` package skips two contribs Immich needs.** It builds
+  sixteen of them and leaves out `cube` and `earthdistance`, which map search
+  depends on. They are built with PGXS from the PostgreSQL source matching the
+  installed version -- and since 17, release tarballs no longer ship the
+  generated parser, so `bison` and `flex` are part of the install.
+- **PGXS does not link libm, and bionic keeps the maths there.** The first
+  pgvector built cleanly and then killed `CREATE EXTENSION` with `cannot
+  locate symbol "acos"`. Every extension is built with `SHLIB_LINK=-lm`.
+- **`pkg install ffmpeg` can leave ffmpeg unable to start.** Its libplacebo
+  wants a newer `libc++` than a phone that has not upgraded lately carries,
+  the post-install hook fails on `CANNOT LINK EXECUTABLE`, and dpkg aborts
+  the whole install with the package half-configured. Lifting `libc++` alone
+  fixes it; a full `pkg upgrade` would also replace the model servers'
+  llama.cpp, which the notes above say to retest after.
+- **The vector index is pgvector, not VectorChord.** Immich recommends
+  VectorChord, a Rust extension built with pgrx: a multi-hour build on a
+  phone. It still accepts pgvector (any 0.5 to 0.x) when
+  `DB_VECTOR_EXTENSION=pgvector` says so, and pgvector is one `make` against
+  `pg_config`, with `-march=native` dropped because Android's clang refuses it.
+- **Two native modules have to be compiled here, against bionic.** `sharp` and
+  `bcrypt` from the official image are linked against glibc and will not load.
+  Dependencies are installed and pruned the way the official Dockerfile does
+  it, with one change: the image installs with prebuilt sharp and switches to
+  the system libvips only when pruning, and there is no prebuilt sharp for
+  `android-arm64`, so `SHARP_FORCE_GLOBAL_LIBVIPS` is set for both steps.
+  Termux's libvips already carries HEIF, JPEG XL and raw through ImageMagick.
+  `node-gyp` is pointed at Termux's patched Node headers with
+  `npm_config_nodedir` rather than letting it download upstream's.
+- **The TypeScript compiler will not run on the phone.** TypeScript 7 is a Go
+  binary shipped per platform, and there is none for `android-arm64`. The
+  `linux-arm64` one, renamed into place, dies with `SIGSYS` on `fanotify_init`
+  during package initialisation -- the same seccomp kill that took out the
+  stock AdGuard binary on `faccessat2`, and it fires before a single line of
+  the compiler runs, so there is nothing to configure around. The compiled
+  JavaScript is portable, so it comes out of the official image.
+- **So does everything else that is portable.** The core workflow plugin is
+  WebAssembly produced by `extism-js`, which has no Android build either.
+  `phone/immich/portable.sh` pulls the compiled server, the plugin, the web
+  app and the geodata out of the image on any machine with Docker: 38 MB. The
+  phone installs the dependencies, compiles the two native modules, and
+  prunes the result into the tree it runs.
+- **Valkey refuses to start while the phone is busy, and only then.** On
+  arm64 it tests at startup for the kernel's MADV_FREE-after-fork bug, and
+  this Samsung kernel has it -- but the test only comes back positive while
+  the kernel is reclaiming memory. So Valkey started on a quiet phone, and
+  refused every restart once a backup upload from the app had the phone
+  under pressure, taking Immich's queue with it. It now runs with snapshots
+  and the append log off, so it never forks and the bug cannot reach it, and
+  the check is switched off with `--ignore-warnings ARM64-COW-BUG`. The
+  launcher also waits for Valkey to answer before starting the server,
+  because `--daemonize` returns before the server has decided to live.
+- **Android counts processes, and Immich pushed the phone over.** Android 12+
+  caps an app's background processes at 32 device-wide and kills processes,
+  not apps, past it or when they burn CPU for long: the phantom process
+  killer. PostgreSQL's helpers, Immich's two processes with up to ten
+  connections each, and exiftool workers took a phone that had run fifteen
+  processes for thirteen days to well past the limit, and the first backup
+  from the app killed Termux four times in an afternoon, a different subset
+  of processes surviving each time. Android's log names it: `Killing
+  PhantomProcessRecord {sshd/u0a323}: Trimming phantom processes`, 25 of
+  them in one second. The fix is an adb setting
+  (`settings_enable_monitor_phantom_procs false`); PostgreSQL is also run
+  without its I/O workers and replication launcher, and Immich's job
+  concurrency kept low, so fewer processes exist to count.
+- **Immich renames its own processes.** `main.ts` sets `process.title`, which
+  on Linux overwrites the argv block that `/proc/<pid>/cmdline` is read from,
+  so the server shows up as `immich` and the API it forks as `immich-api`, with
+  no `node` and no script path left. The panel matches those titles, and folds
+  the child's memory and processor time into the parent's, because the parent
+  runs the jobs and the child serves the browser and neither alone is what
+  Immich costs.
+- **Its telemetry defaults would land on the model servers.** Prometheus is
+  off unless asked for, but its default ports are 8081 and 8082. Moved to
+  2284 and 2285 so a future toggle cannot collide.
+- **No machine learning on the phone.** onnxruntime has no wheels for bionic.
+  Uploads, albums, the map and sharing all work without it; smart search and
+  faces need the official model server on another machine, which one line in
+  the environment file points at.
+
 ### Smaller findings worth keeping
 
 - **Context is allocated per slot.** llama-server gives each parallel slot the
@@ -235,6 +321,9 @@ phone/             what runs on the phone outside the dashboard
   llm-gpu.sh       GPU model server on the Adreno
   tune.sh          keeps heavy processes out of each other's way
   vm.sh            the Alpine VM, kept for Docker work
+  immich.sh        Immich, bringing PostgreSQL and Valkey up alongside it
+  immich/          how Immich gets there: install.sh on the phone, portable.sh
+                   on a machine with Docker for the pieces the phone cannot build
   shim.c           the OpenCL 3.0 shim
   start-vm.sh      the Termux:Boot script that starts everything
 docs/OPERATIONS.md the full operational guide

@@ -6,3 +6,4 @@ registry.json
 guests.json
 id_ed25519*
 known_hosts
+phone/immich/*.tar.gz

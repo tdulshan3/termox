@@ -220,6 +220,38 @@ class State:
                               "the phone.",
                 })
 
+            # Immich keeps running with its database gone -- every request just
+            # fails -- so the process being up says nothing. The launcher brings
+            # PostgreSQL up on start, so a restart from the panel is the fix.
+            if service.get("id") == "immich" and service.get("state") == "running":
+                down = [name for name, key in (("PostgreSQL", "db_open"),
+                                               ("Valkey", "queue_open"))
+                        if not service.get(key)]
+                if down:
+                    found.append({
+                        "title": "Immich is up but %s is not" % " and ".join(down),
+                        "detail": "Restart it from the panel; the launcher starts "
+                                  "both before the server.",
+                    })
+                # Immich retries nothing on its own: a failed job sits in its
+                # queue until someone presses retry in the admin.
+                failed = (service.get("queues") or {}).get("failed") or 0
+                if failed:
+                    found.append({
+                        "title": "%d failed Immich job%s"
+                                 % (failed, "" if failed == 1 else "s"),
+                        "detail": "Open Immich > Administration > Jobs to see "
+                                  "which and retry them.",
+                    })
+                if service.get("api_key_problem"):
+                    found.append({
+                        "title": "Immich API key not accepted",
+                        "detail": service["api_key_problem"].capitalize()
+                                  + ". Make one under Account settings > API keys "
+                                  "with server.about, server.storage, "
+                                  "server.statistics and queue.read.",
+                    })
+
             # A rejected cookie is the one thing here a human has to fix, and it
             # is not self-correcting: it stops the daily claim and it stops
             # compensation being taken before the offer expires. Everything else

@@ -22,6 +22,26 @@ GPU_PORT = int(os.environ.get("TERMOX_LLM_GPU_PORT", "8082"))
 DNS_WEB_PORT = int(os.environ.get("TERMOX_DNS_WEB_PORT", "3000"))
 DNS_PORT = int(os.environ.get("TERMOX_DNS_PORT", "5300"))
 AUTOCLAIM_PORT = int(os.environ.get("TERMOX_AUTOCLAIM_PORT", "8787"))
+IMMICH_PORT = int(os.environ.get("TERMOX_IMMICH_PORT", "2283"))
+IMMICH_DB_PORT = int(os.environ.get("TERMOX_IMMICH_DB_PORT", "5432"))
+IMMICH_QUEUE_PORT = int(os.environ.get("TERMOX_IMMICH_QUEUE_PORT", "6379"))
+
+
+def _read_secret(path):
+    try:
+        with open(path) as fh:
+            return fh.read().strip() or None
+    except OSError:
+        return None
+
+
+# Everything past ping and version needs an API key. It is taken from the
+# environment or, so it never has to sit on a tmux command line, from a file
+# beside the registry. Made in Immich under Account settings > API keys, with
+# server.about, server.storage, server.statistics and queue.read; statistics
+# only answers an admin's key.
+IMMICH_API_KEY = (os.environ.get("TERMOX_IMMICH_API_KEY")
+                  or _read_secret(os.path.join(vms.TERMOX_HOME, "immich.key")))
 
 # Two model servers can run side by side: one on the CPU, one on the Adreno.
 # They are told apart by the port on their command line, because both are the
@@ -72,6 +92,22 @@ SERVICES = [
         "match_port": False,
         "argv_match": "server/index.js",
     },
+    {
+        "id": "immich",
+        "name": "Photos · Immich",
+        # Immich names itself: main.ts sets process.title, and on Linux that
+        # rewrites /proc/<pid>/cmdline, so argv[0] reads `immich` rather than
+        # `node` and no script path survives to match against. The API it
+        # forks is titled `immich-api` the same way.
+        "exe": "immich",
+        "port": IMMICH_PORT,
+        "endpoint": "http://127.0.0.1:%d" % IMMICH_PORT,
+        "kind": "Immich, native",
+        "uses_gpu": False,
+        "match_port": False,
+        "db_port": IMMICH_DB_PORT,
+        "queue_port": IMMICH_QUEUE_PORT,
+    },
 ]
 
 
@@ -106,6 +142,29 @@ def _fetch(url, timeout=2.5):
         with urllib.request.urlopen(url, timeout=timeout) as response:
             return response.read().decode("utf-8", "replace")
     except (urllib.error.URLError, OSError, ValueError):
+        return None
+
+
+def _get(url, headers=None, timeout=2.5):
+    """(status, body). Status is None when nothing answered at all, which is
+    a different thing from a 401: one means the server is down, the other
+    that the key is wrong."""
+    request = urllib.request.Request(url, headers=headers or {})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return response.status, response.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as err:
+        return err.code, None
+    except (urllib.error.URLError, OSError, ValueError):
+        return None, None
+
+
+def _json(text):
+    if not text:
+        return None
+    try:
+        return json.loads(text)
+    except ValueError:
         return None
 
 
@@ -165,6 +224,18 @@ class Services:
 
         if spec["id"] == "autoclaim":
             return _render_autoclaim(entry, spec)
+
+        if spec["id"] == "immich":
+            # The browser is served by a forked child, the jobs run as threads
+            # in the parent. Neither alone is what Immich costs, so the child
+            # is folded into the parent's figures.
+            if pid:
+                api_pid, _ = find_process("immich-api")
+                if api_pid:
+                    child = self._process("immich-api", api_pid, interval)
+                    if child and entry["runtime"]:
+                        _fold_child(entry["runtime"], child)
+            return _render_immich(entry, spec)
 
         if spec["id"] == "dns":
             # AdGuard has no /health; its liveness is whether the resolver
@@ -334,6 +405,122 @@ def _render_dns(entry, spec):
             pass
     else:
         entry["dns_stats"] = None
+    return entry
+
+
+def _fold_child(parent, child):
+    parent["api_pid"] = child["pid"]
+    parent["api_rss"] = child["rss"]
+    parent["rss"] = (parent.get("rss") or 0) + (child.get("rss") or 0)
+    parent["threads"] = (parent.get("threads") or 0) + (child.get("threads") or 0)
+    if parent.get("cpu_percent") is not None and child.get("cpu_percent") is not None:
+        parent["cpu_percent"] = round(parent["cpu_percent"] + child["cpu_percent"], 1)
+
+
+def _render_immich(entry, spec):
+    """Immich answers /api/server/ping and /version without a login.
+
+    Everything more interesting -- asset counts, storage, the job queues --
+    sits behind an API key, so the panel reports what it can prove: the
+    server is answering, which version, and whether the two things it cannot
+    run without are up. PostgreSQL and Valkey are separate processes that the
+    launcher brings up and leaves running, so a stopped Immich beside a live
+    database is the normal resting state, not a fault; a live Immich beside
+    a dead database is the one worth flagging.
+    """
+    entry["db_port"] = spec["db_port"]
+    entry["queue_port"] = spec["queue_port"]
+    entry["db_open"] = vms.probe(spec["db_port"])
+    entry["queue_open"] = vms.probe(spec["queue_port"])
+    entry["version"] = None
+
+    ping = _fetch(spec["endpoint"] + "/api/server/ping")
+    if ping is None or "pong" not in ping:
+        if entry["state"] == "running":
+            entry["state"] = "starting"      # migrating, or the API not yet up
+        return entry
+    entry["state"] = "running"
+
+    version = _fetch(spec["endpoint"] + "/api/server/version")
+    if version:
+        try:
+            data = json.loads(version)
+            entry["version"] = "%s.%s.%s" % (
+                data.get("major"), data.get("minor"), data.get("patch"))
+        except ValueError:
+            pass
+
+    entry["api_key"] = bool(IMMICH_API_KEY)
+    if not IMMICH_API_KEY:
+        return entry
+    return _render_immich_library(entry, spec["endpoint"])
+
+
+def _render_immich_library(entry, base):
+    """What the key unlocks: the library, the disk, the runtime, the queues.
+
+    The status of the statistics call doubles as the verdict on the key. A
+    401 is a key Immich does not know; a 403 is a key that exists but lacks
+    the permission or belongs to a plain user, which is the common mistake
+    because the checkbox is easy to miss and statistics wants an admin.
+    """
+    headers = {"x-api-key": IMMICH_API_KEY, "Accept": "application/json"}
+    status, body = _get(base + "/api/server/statistics", headers)
+    entry["api_key_ok"] = status == 200
+    entry["api_key_problem"] = {
+        401: "Immich rejected the key",
+        403: "the key lacks server.statistics, or is not an admin's",
+    }.get(status) if status not in (200, None) else None
+
+    stats = _json(body)
+    if stats:
+        entry["library"] = {
+            "photos": stats.get("photos") or 0,
+            "videos": stats.get("videos") or 0,
+            "usage": stats.get("usage") or 0,
+            "usage_photos": stats.get("usagePhotos") or 0,
+            "usage_videos": stats.get("usageVideos") or 0,
+            "users": [{
+                "name": user.get("userName"),
+                "photos": user.get("photos") or 0,
+                "videos": user.get("videos") or 0,
+                "usage": user.get("usage") or 0,
+                "quota": user.get("quotaSizeInBytes"),
+            } for user in stats.get("usageByUser") or []],
+        }
+
+    storage = _json(_get(base + "/api/server/storage", headers)[1])
+    if storage:
+        entry["storage"] = {
+            "size": storage.get("diskSizeRaw"),
+            "used": storage.get("diskUseRaw"),
+            "available": storage.get("diskAvailableRaw"),
+            "percent": storage.get("diskUsagePercentage"),
+        }
+
+    about = _json(_get(base + "/api/server/about", headers)[1])
+    if about:
+        entry["about"] = {key: about.get(key) for key in
+                          ("nodejs", "ffmpeg", "libvips", "imagemagick", "exiftool")}
+
+    queues = _json(_get(base + "/api/queues", headers)[1])
+    if isinstance(queues, list):
+        active = waiting = failed = 0
+        busy, paused = [], []
+        for queue in queues:
+            counts = queue.get("statistics") or {}
+            active += counts.get("active") or 0
+            waiting += counts.get("waiting") or 0
+            failed += counts.get("failed") or 0
+            if (counts.get("active") or 0) or (counts.get("waiting") or 0):
+                busy.append({"name": queue.get("name"),
+                             "active": counts.get("active") or 0,
+                             "waiting": counts.get("waiting") or 0})
+            if queue.get("isPaused"):
+                paused.append(queue.get("name"))
+        busy.sort(key=lambda q: (-q["active"], -q["waiting"]))
+        entry["queues"] = {"active": active, "waiting": waiting,
+                           "failed": failed, "busy": busy, "paused": paused}
     return entry
 
 

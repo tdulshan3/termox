@@ -179,6 +179,172 @@ GGUF will not load (`rope.dimension_sections` expected 4, got 3) and unsloth's
 emits degenerate loops at temperature 0. That is not a GPU fault — Qwen2.5-0.5B
 on the same GPU answers correctly. Retest after `pkg upgrade llama-cpp`.
 
+## Immich
+
+Photos, natively: the Immich server on Node, PostgreSQL 18 with pgvector, and
+Valkey for the job queue, all in Termux, all under one tmux session named
+`immich`. The panel lists it under **Services** as *Photos · Immich* with
+start, stop and restart, the version, and whether the database and queue
+are answering.
+
+**Status:** running on the phone since 2026-09-07, v3.1.0, installed with
+these scripts. Five install attempts got it there; what each one taught is in
+the README's findings and folded back into the scripts.
+
+### Install
+
+Two scripts. The first runs anywhere with Docker and pulls the pieces the
+phone cannot build out of the official image: the compiled server (TypeScript
+7 is a Go binary that Android's seccomp filter kills), the core plugin
+(WebAssembly, built by a tool with no Android version), the web app and the
+geodata:
+
+```sh
+phone/immich/portable.sh v3.1.0          # writes immich-portable-v3.1.0.tar.gz, 38 MB
+scp -P 8022 immich-portable-v3.1.0.tar.gz phone/immich.sh phone/immich/install.sh u0_a323@<phone>:
+```
+
+The second runs on the phone and does everything else. Stop the model
+servers first: installing the dependencies and compiling sharp wants a few
+gigabytes for a few minutes, and Android kills the largest process rather
+than swapping.
+
+```sh
+bash install.sh immich-portable-v3.1.0.tar.gz
+```
+
+It installs the packages, builds pgvector, `cube` and `earthdistance` (the
+last two are missing from Termux's `postgresql`), initialises a cluster under
+`~/immich/pg`, unpacks the tarball, installs the server's dependencies with
+sharp and bcrypt compiled against Termux's libvips and libc, prunes that into
+`~/immich/app/server` around the compiled server from the tarball, writes
+`~/immich/immich.env`, and copies the launcher to `~/immich.sh`. Every stage
+checks for its own result, so it can be re-run after a failure. Then:
+
+```sh
+tmux new-session -d -s immich ~/immich.sh
+tmux attach -t immich                     # the log; first start runs the migrations
+```
+
+Open `http://<phone-ip>:2283`; the first visit creates the admin account. The
+boot script starts it with everything else.
+
+### What lives where
+
+```
+~/immich/
+  immich.env     every setting, read by the launcher; chmod 600
+  data/          the library: uploads, thumbnails, encoded video, backups
+  pg/            the PostgreSQL cluster (pg.log beside it)
+  valkey/        the queue's snapshot
+  build/         www/ plugins/ geodata/ and the compiled server, from the tarball
+  app/server/    the server: dist/ from the tarball plus node_modules built on this phone
+  src/           the checkout it was built from; safe to delete
+```
+
+### Settings that matter
+
+| Variable | Set to | Why |
+|---|---|---|
+| `IMMICH_MEDIA_LOCATION` | `~/immich/data` | Termux's own filesystem. Shared storage (`~/storage/shared`) is a FUSE mount that forbids the renames and permission bits Immich relies on. Photos already on the phone go in as an *external library* pointed at `/storage/emulated/0/DCIM` after `termux-setup-storage`, which is read-only from Immich's side and fine. |
+| `DB_VECTOR_EXTENSION` | `pgvector` | Immich would otherwise look for VectorChord. Remove only after installing it. |
+| `IMMICH_MACHINE_LEARNING_ENABLED` | `false` | No onnxruntime for bionic. Run the official `immich-machine-learning` image on a machine on the LAN, set `IMMICH_MACHINE_LEARNING_URL` to it, and switch it on in the admin settings; the environment only seeds the defaults, the database wins afterwards. |
+| `IMMICH_API_METRICS_PORT`, `IMMICH_MICROSERVICES_METRICS_PORT` | 2284, 2285 | The defaults are 8081 and 8082, which are the model servers. |
+| `TZ` | from `getprop persist.sys.timezone` | Immich stamps upload times with it. |
+
+The launcher caps Node's heap at 2 GB. Job concurrency lives in the admin
+settings under *Administration > Settings > Job settings*, and it is the one
+knob that decides whether a backup from the app kills Termux: the defaults
+are three thumbnail workers and five metadata readers, and three copies of
+sharp on large HEICs beside two model servers is more than 10 GB of phone
+will carry. This install stores one thumbnail worker, two metadata readers,
+and one each for smart search and faces; raise them from the settings page
+if the phone has room.
+
+### The panel's page for it
+
+The page is built around leaving: a violet **Open Immich** button, in the
+header, the rail and the overview card, that goes straight to Immich in the
+same tab. Without more it shows the server version, whether PostgreSQL and
+Valkey answer, and the processor and memory of the server and its API child
+together.
+
+Give it an API key and it also shows the library -- photos, videos, bytes,
+per user -- the disk the library sits on, the job queues (what is being
+thumbnailed or transcoded, how much is waiting, what has failed), and the
+runtime Immich reports. In Immich: *Account settings > API keys > New*, from
+an admin account, ticking `server.about`, `server.storage`,
+`server.statistics` and `queue.read`. Then on the phone:
+
+```sh
+echo <key> > ~/.config/termox/immich.key
+tmux kill-session -t scope
+tmux new-session -d -s scope "cd ~/termox && python3 -m termox"
+```
+
+`TERMOX_IMMICH_API_KEY` in the environment works too; the file exists so the
+key never has to sit on a tmux command line. A key Immich rejects, or one
+that lacks statistics, is named on the page and in the attention band rather
+than showing zeros. Failed jobs raise an alarm as well: Immich never retries
+them on its own.
+
+### When everything in Termux dies at once
+
+Android 12 and later run a **phantom process killer**: every process an app
+starts in the background counts against a device-wide limit of 32, and once
+the count is exceeded, or a process burns CPU for long enough, Android kills
+processes -- not the app, individual processes, so what survives looks
+random. Before Immich this phone ran about fifteen: tmux and its shells, two
+model servers, AdGuard, AutoClaim, the panel, sshd. Immich adds two
+processes, up to ten PostgreSQL connections each, PostgreSQL's own helpers
+and exiftool workers, and the first backup from the app took the count past
+the limit and the phone spent an afternoon killing Termux every few minutes.
+
+The fix is one setting, and it needs adb from a computer once (enable
+*Developer options > Wireless debugging* on the phone, pair, then):
+
+```sh
+adb shell "settings put global settings_enable_monitor_phantom_procs false"
+```
+
+That persists across reboots on Android 13. Check it took with:
+
+```sh
+adb shell "settings get global settings_enable_monitor_phantom_procs"     # false
+```
+
+Two things soften it without adb, and are done here: PostgreSQL runs
+without its three I/O workers and its replication launcher, nine processes
+down to five (`io_method = sync`, `wal_level = minimal`,
+`max_wal_senders = 0`, `max_logical_replication_workers = 0` in
+`~/immich/pg/postgresql.conf`), and Immich's job concurrency is kept low so
+it spawns fewer exiftool and ffmpeg processes at once. They lower the count;
+they do not lift the limit. Add Termux to *Battery > Never sleeping apps* as
+well, which covers the other reason Samsung kills a background app.
+
+Termux:Boot only runs the start script at boot, so after a kill, open Termux
+and run `bash ~/.termux/boot/start-vm.sh`.
+
+### Day to day
+
+```sh
+cd ~/immich/app/server && node dist/main.js immich-admin        # list-users, reset-admin-password
+PGPASSWORD=$(sed -n 's/^DB_PASSWORD=//p' ~/immich/immich.env) pg_dump -h 127.0.0.1 -U postgres immich > immich.sql
+```
+
+Immich's own scheduled database backup works too: it needs `pg_dumpall` on
+the path, which Termux's `postgresql` provides, and writes under
+`~/immich/data/backups`.
+
+**Updating.** `IMMICH_TAG=v3.2.0 phone/immich/portable.sh v3.2.0` on the desktop,
+copy the tarball over, `IMMICH_TAG=v3.2.0 bash install.sh <tarball>` on the
+phone. The server is rebuilt; the database, the environment file and the
+library are left alone, and Immich migrates the schema on its next start.
+
+**Stopping from the panel** signals the server; PostgreSQL and Valkey stay up,
+because they are small and they hold the library. `pg_ctl -D ~/immich/pg stop`
+and `valkey-cli shutdown` if they should go too.
+
 ## Environment
 
 | Variable | Default | Meaning |
@@ -191,6 +357,10 @@ on the same GPU answers correctly. Retest after `pkg upgrade llama-cpp`.
 | `TERMOX_SSH_TIMEOUT` | 45 | seconds a guest probe may take |
 | `TERMOX_LLM_URL` | `http://127.0.0.1:8081` | model server to scrape |
 | `TERMOX_MASTER_TIMEOUT` | 90 | seconds to establish the shared SSH connection |
+| `TERMOX_IMMICH_PORT` | 2283 | where Immich answers |
+| `TERMOX_IMMICH_DB_PORT` | 5432 | Immich's PostgreSQL, probed for the tile |
+| `TERMOX_IMMICH_QUEUE_PORT` | 6379 | Immich's Valkey, probed for the tile |
+| `TERMOX_IMMICH_API_KEY` | unset, or `~/.config/termox/immich.key` | unlocks the library, disk, queues and runtime on Immich's page |
 
 ## Commands
 

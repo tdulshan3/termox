@@ -603,6 +603,14 @@ function rail(data) {
       sub = [(c.auto ? c.settled + ' of ' + c.auto + ' claimed' : 'no profiles'),
              waiting ? waiting + ' compensation waiting' : null,
              bytes(runtime.rss)].filter(Boolean).join(' · ');
+    } else if (service.id === 'immich') {
+      const lib = service.library;
+      const q = service.queues;
+      sub = [lib ? num(lib.photos) + ' photos' : (service.version ? 'v' + service.version : 'answering'),
+             q && q.active ? num(q.active) + ' working' : null,
+             service.db_open ? null : 'database down',
+             service.queue_open ? null : 'queue down',
+             bytes(runtime.rss)].filter(Boolean).join(' · ');
     } else {
       const rate = metrics.tokens_per_second || metrics.average_tps;
       sub = [rate ? num(rate, 1) + ' tok/s' : 'no requests yet',
@@ -613,7 +621,9 @@ function rail(data) {
       dot: transitional(service.state) ? 'busy' : service.state === 'running' ? 'up' : 'down',
       metric: service.state === 'running' ? pct(runtime.cpu_percent) : null,
       sub: sub,
-      actions: actions('svc:' + service.id, service.state, service.job, service.name, 'small'),
+      actions: actions('svc:' + service.id, service.state, service.job, service.name, 'small')
+        .concat(service.id === 'immich' && service.state === 'running'
+                ? [openImmich(service, null, 'Open', 'small')] : []),
     }));
   });
 
@@ -931,6 +941,20 @@ function serviceCard(service) {
           ['Day', (service.claim_day || '--')
                   + (service.claim_timezone ? ' · ' + service.claim_timezone : '')],
         ])
+      : service.id === 'immich'
+      ? dl(service.library ? [
+          ['Photos', num(service.library.photos) + ' · ' + bytes(service.library.usage_photos)],
+          ['Videos', num(service.library.videos) + ' · ' + bytes(service.library.usage_videos)],
+          ['Working', service.queues && service.queues.active
+              ? num(service.queues.active) + ' jobs · ' + num(service.queues.waiting) + ' queued'
+              : 'idle'],
+          ['Database', photosDeps(service)],
+        ] : [
+          ['Version', service.version ? 'v' + service.version : '--'],
+          ['Database', photosDeps(service)],
+          ['Resident', bytes(runtime.rss)],
+          ['Uptime', duration(runtime.uptime)],
+        ])
       : dl([
           ['Generation', rate ? num(rate, 1) + ' tok/s' : 'no requests yet'],
           ['Served', num(metrics.tokens_total) + ' tokens'],
@@ -938,7 +962,8 @@ function serviceCard(service) {
         ]),
     h('div', { style: 'display:flex;gap:8px;margin-top:auto;flex-wrap:wrap' },
       actions('svc:' + service.id, service.state, service.job, service.name)
-        .concat(service.id === 'autoclaim' && running ? [openAutoclaim('Open')] : [])),
+        .concat(service.id === 'autoclaim' && running ? [openAutoclaim('Open')] : [])
+        .concat(service.id === 'immich' && running ? [openImmich(service, null, 'Open Immich')] : [])),
   ]);
 }
 
@@ -971,6 +996,39 @@ function openAutoclaim(label, kind) {
     href: AUTOCLAIM_PATH, target: '_blank', rel: 'noreferrer',
     text: label || 'Open',
   });
+}
+
+// Immich has accounts of its own and binds to every interface, so unlike
+// AutoClaim it is linked directly: the loopback address the poller uses is
+// swapped for whatever the browser reached this panel by.
+function photosUrl(service, address) {
+  return (service.endpoint || '').replace('127.0.0.1', address || location.hostname);
+}
+
+function photosDeps(service) {
+  return (service.db_open ? 'up' : 'down') + ' · queue ' + (service.queue_open ? 'up' : 'down');
+}
+
+// The one button on the panel that leaves it. A plain link in the same tab,
+// because Immich is a destination rather than a tool to glance at; the phone
+// serves both, so the browser simply moves from one port to the other.
+// Filled with the violet reading hue rather than the accent: the accent is
+// for alarms and primary panel actions, and this is neither -- it is
+// Immich's own door, and white type on it reads the same on either ground.
+function openImmich(service, address, label, size) {
+  return h('a', {
+    class: 'btn',
+    style: 'justify-content:flex-start;background:var(--tx-violet);color:#fff;'
+         + 'border-color:var(--tx-violet)'
+         + (size === 'small' ? ';font-size:11px;padding:3px 9px' : ''),
+    href: photosUrl(service, address),
+    text: label || 'Open Immich',
+  });
+}
+
+function queueName(name) {
+  // thumbnailGeneration -> thumbnail generation
+  return String(name || '').replace(/([A-Z])/g, ' $1').toLowerCase().trim();
 }
 
 function compensationPending(service) {
@@ -1354,6 +1412,7 @@ function renderService(data, service) {
   const running = service.state === 'running';
   const isDns = service.id === 'dns';
   const isClaim = service.id === 'autoclaim';
+  if (service.id === 'immich') return renderPhotos(data, service);
   // Only the model servers get the llama.cpp treatment: throughput tiles,
   // generation-rate charts, /metrics endpoints. The other two have none of it.
   const isModel = !isDns && !isClaim;
@@ -1511,6 +1570,209 @@ function renderService(data, service) {
 
   out.push(h('section', { style: 'padding:24px 24px 40px' }, [backButton()]));
   return out;
+}
+
+/* ---------------------------------------------------------------- photos */
+
+/* Immich's page is built around leaving: the library lives in Immich, and the
+   panel's job is to say whether it is well and hand you through. With an API
+   key it also shows what is in there and what the phone is doing to it. */
+function renderPhotos(data, service) {
+  const runtime = service.runtime || {};
+  const library = service.library;
+  const storage = service.storage;
+  const queues = service.queues;
+  const about = service.about || {};
+  const address = ((data.host || {}).identity || {}).address || location.hostname;
+  const target = 'svc:' + service.id;
+  const running = service.state === 'running';
+  const url = photosUrl(service, address);
+  const out = [];
+
+  const users = library ? library.users || [] : [];
+  const busy = queues ? queues.busy || [] : [];
+
+  out.push(h('div', {
+    'data-tx-pad': 'true',
+    style: 'display:flex;align-items:flex-end;justify-content:space-between;gap:24px;'
+         + 'flex-wrap:wrap;padding:24px 24px 16px;border-bottom:' + DIV,
+  }, [
+    h('div', { style: 'min-width:0' }, [
+      h('div', { style: 'display:flex;align-items:center;gap:12px;flex-wrap:wrap' }, [
+        h('h1', { style: 'margin:0;font-size:42px', text: 'Immich' }),
+        stateTag(service.state, transitional(service.state) ? 'busy' : running ? 'up' : 'down'),
+        service.version ? h('span', { class: 'tag tag-outline', 'data-tx-hue': 'violet',
+                                      text: 'v' + service.version }) : null,
+      ]),
+      h('div', { class: 'text-muted', style: 'font-size:13px;max-width:70ch',
+                 text: 'Your photos, on this phone: the Immich server on Node, PostgreSQL '
+                     + 'with pgvector, and Valkey for its queue, all native. The library '
+                     + 'itself lives in Immich; open it to browse, upload and share.' }),
+    ]),
+    h('div', { style: 'display:flex;gap:8px;flex-wrap:wrap' },
+      (running ? [openImmich(service, address, 'Open Immich')] : [])
+        .concat(actions(target, service.state, service.job, service.name))),
+  ]));
+
+  const strip = activity(service.job, service.state);
+  if (strip) out.push(strip);
+
+  out.push(h('div', {
+    style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:2px;'
+         + 'background:var(--color-divider);border-bottom:' + DIV,
+  }, library ? [
+    stat('Photos', num(library.photos), '', bytes(library.usage_photos), 'violet'),
+    stat('Videos', num(library.videos), '', bytes(library.usage_videos), 'violet'),
+    stat('Library', bytes(library.usage), '',
+         users.length + (users.length === 1 ? ' user' : ' users'), 'violet'),
+    storage
+      ? stat('Disk', num(storage.percent, 0), '%',
+             bytes(storage.available) + ' free of ' + bytes(storage.size), 'violet')
+      : null,
+    queues
+      ? stat('Working', num(queues.active), queues.active === 1 ? ' job' : ' jobs',
+             queues.waiting ? num(queues.waiting) + ' queued' : 'nothing queued', 'violet')
+      : null,
+    stat('Uptime', duration(runtime.uptime), '',
+         bytes(runtime.rss) + ' resident · ' + pct(runtime.cpu_percent) + ' of a core',
+         'violet'),
+  ].filter(Boolean) : [
+    stat('Server', service.version ? 'v' + service.version : '--', '',
+         running ? 'answering on ' + (service.endpoint || '').split(':').pop() : service.state,
+         'violet'),
+    stat('Database', service.db_open ? 'up' : 'down', '',
+         'PostgreSQL on ' + (service.db_port || '--'), service.db_open ? 'violet' : 'red'),
+    stat('Queue', service.queue_open ? 'up' : 'down', '',
+         'Valkey on ' + (service.queue_port || '--'), service.queue_open ? 'violet' : 'red'),
+    stat('Processor', num(runtime.cpu_percent), '%', 'server and API together', 'violet'),
+    stat('Resident', bytes(runtime.rss), '',
+         runtime.api_rss ? bytes(runtime.api_rss) + ' of it the API'
+                         : (runtime.threads || '--') + ' threads', 'violet'),
+    stat('Uptime', duration(runtime.uptime), '',
+         'pid ' + (runtime.pid || '--') + (runtime.api_pid ? ' · api ' + runtime.api_pid : ''),
+         'violet'),
+  ]));
+
+  // What is in the library, and what the phone is doing to it. Without a key
+  // the two panels say how to get one rather than showing zeros.
+  out.push(h('div', {
+    style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:2px;'
+         + 'background:var(--color-divider);border-bottom:' + DIV,
+  }, [
+    h('section', { style: 'background:var(--color-bg);padding:24px' }, [
+      h('h3', { style: 'margin:0 0 16px', text: 'Library' }),
+      library
+        ? h('div', {}, [
+            storage ? h('div', { style: 'margin-bottom:16px' }, [
+              h('div', { style: 'display:flex;justify-content:space-between;font-size:12px;margin-bottom:6px' }, [
+                h('span', { class: 'text-muted', text: 'Disk the library sits on' }),
+                h('span', { style: 'font-variant-numeric:tabular-nums',
+                            text: bytes(storage.used) + ' of ' + bytes(storage.size) }),
+              ]),
+              bar(storage.percent, 'violet'),
+            ]) : null,
+            dl(users.map((user) => [
+              user.name || '(unnamed)',
+              num(user.photos) + ' photos · ' + num(user.videos) + ' videos · ' + bytes(user.usage)
+                + (user.quota ? ' of ' + bytes(user.quota) : ''),
+            ]).concat([
+              ['Photos', num(library.photos) + ' · ' + bytes(library.usage_photos)],
+              ['Videos', num(library.videos) + ' · ' + bytes(library.usage_videos)],
+            ])),
+          ])
+        : keyNote(service),
+    ]),
+    h('section', { style: 'background:var(--color-bg);padding:24px' }, [
+      h('h3', { style: 'margin:0 0 16px', text: 'Working on' }),
+      queues
+        ? (busy.length
+            ? dl(busy.map((q) => [
+                queueName(q.name),
+                (q.active ? num(q.active) + ' running' : '')
+                  + (q.active && q.waiting ? ' · ' : '')
+                  + (q.waiting ? num(q.waiting) + ' waiting' : ''),
+              ]))
+            : h('div', { class: 'text-muted', style: 'font-size:13px',
+                         text: 'Idle. Nothing is being thumbnailed, transcoded or read.' }))
+        : h('div', { class: 'text-muted', style: 'font-size:13px',
+                     text: service.api_key
+                       ? 'The key did not unlock the queues; it needs queue.read.'
+                       : 'Needs an API key; see the note beside.' }),
+      queues && (queues.failed || (queues.paused || []).length)
+        ? h('div', { class: 'text-muted', style: 'font-size:12px;margin-top:12px' }, [
+            queues.failed ? h('span', { 'data-tx-hue': 'red',
+                                        style: 'color:var(--tx-red-ink)',
+                                        text: num(queues.failed) + ' failed, waiting for a retry in Immich. ' }) : null,
+            (queues.paused || []).length
+              ? 'Paused: ' + queues.paused.map(queueName).join(', ') + '.' : null,
+          ])
+        : null,
+    ]),
+  ]));
+
+  const proc = serviceReading(service.id, 'cpu');
+  out.push(h('section', { style: 'padding:24px;border-bottom:' + DIV }, [
+    h('div', {
+      'data-tx-charts': 'true',
+      style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(400px,1fr));gap:32px',
+    }, [
+      figure('Processor',
+             readout(pct(latest(proc)), 'peak ' + pct(peak(proc))),
+             proc, { hue: 'violet', label: 'processor use',
+                     note: 'server and API together; thumbnails and transcodes show up here' }),
+    ]),
+  ]));
+
+  out.push(h('div', {
+    style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:2px;'
+         + 'background:var(--color-divider);border-bottom:' + DIV,
+  }, [
+    h('section', { style: 'background:var(--color-bg);padding:24px' }, [
+      h('h3', { style: 'margin:0 0 16px', text: 'Reaching it' }),
+      running ? h('div', { style: 'margin-bottom:16px' }, [openImmich(service, address, 'Open Immich')]) : null,
+      dl([
+        ['Web and API', h('a', { href: url, style: 'font-family:ui-monospace,monospace', text: url })],
+        ['Mobile app', 'point the Immich app at that address; the phone has to stay '
+                       + 'reachable, on the LAN or over Tailscale'],
+        ['Database', 'PostgreSQL on 127.0.0.1:' + (service.db_port || '--')
+                     + ', ' + (service.db_open ? 'up' : 'down')],
+        ['Queue', 'Valkey on 127.0.0.1:' + (service.queue_port || '--')
+                  + ', ' + (service.queue_open ? 'up' : 'down')],
+        about.nodejs ? ['Runtime', 'Node ' + about.nodejs.replace(/^v/, '')
+                        + (about.ffmpeg ? ' · ffmpeg ' + about.ffmpeg : '')
+                        + (about.libvips ? ' · libvips ' + about.libvips : '')
+                        + (about.exiftool ? ' · exiftool ' + about.exiftool : '')] : null,
+      ]),
+      h('div', { class: 'text-muted', style: 'font-size:12px;margin-top:12px',
+                 text: 'Immich keeps its own accounts, so it is linked directly; the first '
+                     + 'visit creates the admin. No machine learning runs on the phone: '
+                     + 'smart search and faces need the official model server on another '
+                     + 'machine, pointed at from immich.env.' }),
+    ]),
+    launcherPanel(target),
+  ]));
+
+  out.push(h('section', { style: 'padding:24px 24px 40px' }, [backButton()]));
+  return out;
+}
+
+function keyNote(service) {
+  const problem = service.api_key_problem;
+  return h('div', { class: 'text-muted', style: 'font-size:13px;max-width:60ch' }, [
+    problem
+      ? h('p', { style: 'margin:0 0 10px;color:var(--tx-red-ink)',
+                 text: 'The API key was not accepted: ' + problem + '.' })
+      : h('p', { style: 'margin:0 0 10px',
+                 text: 'Photo and video counts, disk use and the job queues live behind '
+                     + 'Immich\'s API. Give the panel a key and they appear here.' }),
+    h('p', { style: 'margin:0 0 10px',
+             text: 'In Immich: Account settings > API keys > New, ticking server.about, '
+                 + 'server.storage, server.statistics and queue.read, from an admin '
+                 + 'account. Then on the phone:' }),
+    h('pre', { style: 'margin:0;font-size:12px;white-space:pre-wrap',
+               text: 'echo <key> > ~/.config/termox/immich.key\ntmux kill-session -t scope\n'
+                   + 'tmux new-session -d -s scope "cd ~/termox && python3 -m termox"' }),
+  ]);
 }
 
 /* --------------------------------------------------------------- machine */
