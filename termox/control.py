@@ -48,6 +48,15 @@ SERVICES = {
         "exe": "node", "match": "server/index.js", "probe": 8787,
         "ready": "the scheduler is up and the API is answering",
     },
+    "immich": {
+        "session": "immich", "command": "~/immich.sh",
+        # Immich sets its own process title, so /proc shows `immich`, not
+        # `node` -- see services.py. Stopping it SIGTERMs the parent; the API
+        # child it forked goes with the tmux session, which is killed last.
+        "exe": "immich", "match": None, "probe": 2283,
+        "waiting": "bringing up the database, migrating, starting the workers",
+        "ready": "the API is answering",
+    },
 }
 
 LAUNCHERS_PATH = os.path.join(vms.TERMOX_HOME, "launchers.json")
