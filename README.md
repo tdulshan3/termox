@@ -48,6 +48,14 @@ The 865 is 4 big cores plus 4 little ones. A fifth thread lands on an
 efficiency core that every synchronisation barrier then waits for. **Never let
 the thread count default.**
 
+That holds for generation only. Prompts are batches, and batches do gain from
+the little cores: on Qwen3.5-4B, seven threads on cores 1-7 read prompts 15%
+faster than four (6.49 against 5.64 tok/s) while generating 4% slower.
+llama-server takes the two counts separately, so `llm.sh` runs `-t 4 -tb 7`.
+Small models lose the most from a slow core on each step: seven threads take a
+third off the 0.8B's generation, and an eighth, on the core the other services
+share, still takes it to 0.19 tok/s.
+
 ### The GPU works, and is the slower option
 
 The Adreno 650 can be made to run inference from unrooted Termux, which took
@@ -94,23 +102,40 @@ idle system.
 | **Load average** | **not available** |
 | **Host network throughput** | **not available** — the guest's own interfaces still are |
 
-### CPU pinning made things worse
+### The kernel hides the cores it has parked
 
-An earlier version of `tune.sh` pinned the model server to the "fast" cores,
-ranked by `cpuinfo_max_freq`. That **halved** throughput — 8.7 tok/s pinned
-against 19.5 unpinned — because Android inverts the ranking for background
-apps:
+Two versions of `tune.sh` slowed the model server down, and both fell into the
+same trap. Qualcomm's `core_ctl` **parks big cores that have gone idle** — here
+core 4 and the prime core 7 — and this kernel leaves parked cores out of what
+`sched_getaffinity()` reports, although `Cpus_allowed` in `/proc` still lists
+them. That is what "the permitted core set changes between two calls" was.
+They wake as soon as there is load, unless a mask built from that report
+keeps a process off them:
 
-```
-cpu7  prime,  2841 MHz max  ->  capped at 1747, running  845 MHz
-cpu4  perf,   2419 MHz max  ->  capped at 1747, running 1382 MHz
-cpu0  little, 1804 MHz max  ->  uncapped,       running 1612 MHz
-```
+| Qwen3.5-4B, 4 threads | prompt | generation |
+|---|---|---|
+| free to use all four big cores | 5.62 | 4.24 tok/s |
+| mask copied from an idle report | 3.55 | 2.62 |
 
-Hardware maximum frequency is the wrong metric: pinning to the "fastest" cores
-pins to the *most throttled* ones. The permitted core set also moves — it was
-observed changing between two consecutive calls of the same script. The model
-servers are therefore left unpinned; only QEMU is confined and niced.
+The first version ranked the reported cores by `cpuinfo_max_freq` and
+"halved" throughput; ranked from that set, the fastest four are two big cores
+and two little ones. It blamed the frequency caps it saw, which are real but
+come from heat and cap a whole cluster (below). The next version copied the
+report onto llama-server outright. `tune.sh` now builds masks from the core
+count: **core 0 for everything else, cores 1-7 for the CPU model server** and
+1-3 for the GPU server's host threads, every thread, re-applied every 30
+seconds.
+
+### The big cores throttle at 40 C skin
+
+Samsung's overheat protection caps both big clusters at **1747 MHz** (of 2419
+and 2841) once the skin sensor nears 40 C (`sys.siop.level` above 0), and lifts
+the cap about a minute after it cools. From 37 C, one minute of full load
+trips it, and screen mirroring's software encoder is enough to hold it there.
+It costs the 4B about 30% of its prompt speed and 16% of its generation. Screen
+state and Android's fixed-performance mode do not move it, and the knob behind
+it (`/sys/power/cpufreq_max_limit`) is closed even to `adb shell`. Cooling is
+the only lever left.
 
 ### AdGuard Home runs natively, but only just
 
@@ -318,8 +343,9 @@ termox/            the dashboard package (stdlib only)
 phone/             what runs on the phone outside the dashboard
   adguard.sh       AdGuard Home, with the Android workarounds it needs
   llm.sh           CPU model server, with the measurements that justify it
+  llm-use.sh       `llm-use 4b`: switch the CPU server's model, one at a time
   llm-gpu.sh       GPU model server on the Adreno
-  tune.sh          keeps heavy processes out of each other's way
+  tune.sh          core 0 for the services, cores 1-7 for the model servers
   vm.sh            the Alpine VM, kept for Docker work
   immich.sh        Immich, bringing PostgreSQL and Valkey up alongside it
   immich/          how Immich gets there: install.sh on the phone, portable.sh

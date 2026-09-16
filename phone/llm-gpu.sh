@@ -21,12 +21,22 @@
 #                    libggml-opencl.so will not even dlopen.
 #   -fa off          the flash-attention kernels assume Adreno 7xx work group
 #                    geometry and abort with CL_INVALID_WORK_GROUP_SIZE here.
+#
+# Retested on llama.cpp 0.4.1: still correct for Qwen2.5 (13.7 tok/s), still
+# wrong for Qwen3.5. --load-mode none replaces --no-mmap, which 0.4.1 refuses.
+#
+# CORES. The host side of GPU generation is CPU work, and fast cores help it:
+# 16.7 tok/s with its threads free on cores 1-7, 11.1 confined to the little
+# cores 1-3. It lives on 1-3 anyway, to leave the big cores to the CPU server;
+# tune.sh keeps it there. The two servers still slow each other down through
+# shared memory and heat: while this one generated, the 4B on the CPU server
+# dropped from 5.5 / 4.2 to 4.7 / 2.5 tok/s (prompt / generation).
 export LD_LIBRARY_PATH=$PREFIX/opt/vendor/lib
 export LD_PRELOAD=$HOME/clshim/libclshim.so
-exec llama-server \
+exec taskset -c 1-3 llama-server \
   -m $HOME/models/Qwen2.5-0.5B-Instruct-Q4_0.gguf \
   -ngl 99 -fa off \
-  -t 2 -c 8192 --parallel 1 -b 256 --no-mmap \
+  -t 2 -c 8192 --parallel 1 -b 256 --load-mode none \
   --host 0.0.0.0 --port 8082 \
   --metrics \
   --alias qwen2.5-0.5b-gpu
