@@ -123,7 +123,8 @@ a { color: var(--color-accent-700); }
 
 /* The rail entry itself: selection is a field, not a border. */
 [data-tx-entry] { border-bottom: 1px solid var(--color-divider); }
-[data-tx-entry] > button:first-child:hover { background: color-mix(in srgb, var(--color-text) 5%, transparent); }
+[data-tx-entry] > button:first-child:hover,
+[data-tx-entry] > a:first-child:hover { background: color-mix(in srgb, var(--color-text) 5%, transparent); }
 [data-tx-entry][data-tx-on="true"] { background: color-mix(in srgb, var(--color-accent) 12%, transparent); box-shadow: inset 3px 0 0 var(--color-accent); }
 
 /* Charts carry their reading's hue on the stroke; the fill stays ink so the

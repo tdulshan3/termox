@@ -501,33 +501,73 @@ function toggleTheme() {
 
 function railEntry(opts) {
   const on = state.view === opts.view;
+  const face = 'display:block;width:100%;text-align:left;padding:12px 16px'
+             + (opts.actions ? ' 6px' : '') + ';background:transparent;border:0;'
+             + 'cursor:pointer;font:inherit;color:inherit;text-decoration:none';
+  const inner = [
+    h('span', { style: 'display:flex;align-items:baseline;gap:8px' }, [
+      opts.dot ? h('span', { 'data-tx-dot': opts.dot, style: 'flex:none' }) : null,
+      h('span', {
+        style: 'font-family:var(--font-heading);font-weight:800;font-size:15px;flex:1;min-width:0',
+        text: opts.name,
+      }),
+      opts.metric ? h('span', {
+        style: 'font-size:13px;font-variant-numeric:tabular-nums', text: opts.metric,
+      }) : null,
+    ]),
+    h('span', {
+      class: 'text-muted',
+      style: 'display:block;font-size:11.5px;padding-left:' + (opts.dot ? '16px' : '0'),
+      text: opts.sub,
+    }),
+  ];
   return h('div', {
     'data-tx-entry': 'true', 'data-tx-on': on ? 'true' : 'false',
   }, [
-    h('button', {
-      type: 'button',
-      style: 'display:block;width:100%;text-align:left;padding:12px 16px'
-           + (opts.actions ? ' 6px' : '') + ';background:transparent;border:0;'
-           + 'cursor:pointer;font:inherit;color:inherit',
-      onclick: () => go(opts.view),
-    }, [
-      h('span', { style: 'display:flex;align-items:baseline;gap:8px' }, [
-        opts.dot ? h('span', { 'data-tx-dot': opts.dot, style: 'flex:none' }) : null,
-        h('span', {
-          style: 'font-family:var(--font-heading);font-weight:800;font-size:15px;flex:1;min-width:0',
-          text: opts.name,
-        }),
-        opts.metric ? h('span', {
-          style: 'font-size:13px;font-variant-numeric:tabular-nums', text: opts.metric,
-        }) : null,
-      ]),
-      h('span', {
-        class: 'text-muted',
-        style: 'display:block;font-size:11.5px;padding-left:' + (opts.dot ? '16px' : '0'),
-        text: opts.sub,
-      }),
-    ]),
+    // An app hosted by the panel is a page of its own, so its entry is a
+    // link rather than a view switch.
+    opts.href
+      ? h('a', { href: opts.href, style: face }, inner)
+      : h('button', { type: 'button', style: face, onclick: () => go(opts.view) }, inner),
     opts.actions ? h('div', { style: 'display:flex;gap:6px;padding:0 16px 12px' }, opts.actions) : null,
+  ]);
+}
+
+/* ------------------------------------------------------------------ apps */
+
+const TODO_PATH = '/todo/';
+
+function todoUrl() {
+  return TODO_PATH + (TOKEN ? '?token=' + encodeURIComponent(TOKEN) : '');
+}
+
+function todoSummary(todo) {
+  return [
+    todo.overdue ? todo.overdue + ' overdue' : null,
+    (todo.open || 0) + ' open',
+    (todo.ideas || 0) + (todo.ideas === 1 ? ' idea' : ' ideas'),
+  ].filter(Boolean).join(' · ');
+}
+
+function todoSection(data) {
+  const todo = data.todo;
+  if (!todo) return null;
+  return h('section', { style: 'padding:24px;border-bottom:' + DIV }, [
+    sectionHead('Todo',
+                'Ideas on the left, one calendar that zooms from a year to a day, the selected '
+              + 'todo on the right. Stored beside the registry and shared by every device here.',
+                h('a', { class: 'btn btn-primary', href: todoUrl(), style: 'justify-content:flex-start' },
+                  ['Open Todo'])),
+    h('div', {
+      style: 'display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:2px;'
+           + 'background:var(--color-divider)',
+    }, [
+      stat('Due today', num(todo.today), null, todo.today ? 'still open' : 'nothing due', 'blue'),
+      stat('Overdue', num(todo.overdue), null,
+           todo.overdue ? 'open past their day' : 'nothing slipped', todo.overdue ? 'red' : null),
+      stat('Open', num(todo.open), null, 'of ' + num(todo.todos) + ' todos', 'teal'),
+      stat('Ideas', num(todo.ideas), null, 'waiting for a day', 'violet'),
+    ]),
   ]);
 }
 
@@ -627,10 +667,21 @@ function rail(data) {
     }));
   });
 
+  const todo = data.todo || {};
+  kids.push(h('div', { 'data-tx-group': 'true' }, [
+    h('span', { text: 'Apps' }),
+    h('span', { 'data-tx-count': 'true', text: todo.today ? todo.today + ' due today' : 'nothing due' }),
+  ]));
+  kids.push(railEntry({
+    view: 'app:todo', href: todoUrl(), dot: 'live', name: 'Todo',
+    metric: todo.today ? String(todo.today) : null,
+    sub: todoSummary(todo),
+  }));
+
   kids.push(h('div', { style: 'border-top:' + DIV }));
 
   return h('nav', {
-    'aria-label': 'Machines and services', 'data-tx-rail': 'true',
+    'aria-label': 'Machines, services and apps', 'data-tx-rail': 'true',
     style: 'border-right:' + DIV + ';position:sticky;top:59px;align-self:start',
   }, kids);
 }
@@ -804,6 +855,7 @@ function renderOverview(data) {
     }, nodes.map(nodeCard).concat(services.map(serviceCard))),
   ]));
 
+  out.push(todoSection(data));
   out.push(wiringSection(data));
   out.push(pathsSection(data));
   return out;

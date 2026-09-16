@@ -17,12 +17,21 @@ import urllib.parse
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from . import control, host, vms
+from . import control, host, todo, vms
 from .series import Readings
 from .guestlink import GuestLink
 from .services import Services
 
 HERE = os.path.dirname(os.path.abspath(__file__))
+
+# The Todo app: a page under /todo/ and one JSON document under /api/todo,
+# kept beside the registry. It is served here rather than as its own process
+# so it shares the panel's port, token and boot line, and so the rail can
+# show what is due without loading the app.
+TODO_PREFIX = "/todo"
+TODO_PATH = os.path.join(vms.TERMOX_HOME, "todo.json")
+TODO_BODY_MAX = 8 * 1024 * 1024
+TODO = todo.Store(TODO_PATH)
 
 
 def _bytes(value):
@@ -295,6 +304,13 @@ class State:
             "directory": self._short(HERE),
             "detail": self._short(vms.REGISTRY_PATH),
             "state": "running",
+        }, {
+            "name": "Todo",
+            "kind": "app",
+            "binary": self._short(sys.executable),
+            "directory": self._short(os.path.join(STATIC, "todo")),
+            "detail": self._short(TODO_PATH),
+            "state": "running",
         }]
         for service in self.services:
             runtime = service.get("runtime") or {}
@@ -354,6 +370,7 @@ class State:
                 "readings": self.readings.payload(),
                 "serviceReadings": self.service_readings.payload(),
                 "alerts": self.alerts(),
+                "todo": TODO.summary(),
                 "server": {"uptime": time.time() - self.started,
                            "version": "0.1.0"},
                 "served_at": time.time(),
@@ -627,6 +644,22 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "token required"}, 401)
         self._proxy_autoclaim("DELETE")
 
+    def do_PUT(self):                                   # noqa: N802 - stdlib API
+        path, _, raw_query = self.path.partition("?")
+        if not self._authorised(_query(raw_query)):
+            return self._json({"error": "token required"}, 401)
+        if path != "/api/todo":
+            return self._send(404, b"not found", "text/plain")
+        length = int(self.headers.get("Content-Length") or 0)
+        if length > TODO_BODY_MAX:
+            return self._json({"error": "document too large"}, 413)
+        try:
+            body = self.rfile.read(length)
+        except OSError:
+            return self._json({"error": "unreadable request"}, 400)
+        code, payload = todo.handle(TODO, "PUT", body)
+        return self._json(payload, code)
+
     def do_POST(self):                                  # noqa: N802 - stdlib API
         path, _, raw_query = self.path.partition("?")
         query = _query(raw_query)
@@ -685,8 +718,24 @@ class Handler(BaseHTTPRequestHandler):
                                    "guests": STATE.guests})
         if path == "/api/health":
             return self._json({"ok": True, "uptime": time.time() - STATE.started})
+        if path == "/api/todo":
+            code, payload = todo.handle(TODO, "GET", None)
+            return self._json(payload, code)
+        if path == "/api/todo/summary":
+            return self._json(TODO.summary())
         if path in ("/", "/index.html"):
             return self._file("index.html")
+        if path == TODO_PREFIX:
+            # The app links its assets relatively, which only resolves from
+            # a directory URL.
+            self.send_response(301)
+            self.send_header("Location", TODO_PREFIX + "/"
+                             + ("?" + raw_query if raw_query else ""))
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return
+        if path == TODO_PREFIX + "/":
+            return self._file("todo/index.html")
         # everything else that is not an API route is a static asset; the page
         # links them relatively (ds.css, app.js, fonts/archivo.woff2) and the
         # /static/ prefix is kept working for anything that still uses it
