@@ -72,6 +72,13 @@ def _tmux(*args, timeout=20):
         return None
 
 
+def _exact(session):
+    """A tmux target that matches `session` and nothing else. A bare name with
+    no exact match falls back to a prefix match, so killing a session that
+    has already ended with its process -- `llm` -- would kill `llmgpu`."""
+    return "=" + session
+
+
 def _find(exe, match=None):
     """pid of a process whose argv[0] basename is `exe`, optionally requiring
     `match` somewhere in its arguments (that is how two llama-servers are told
@@ -245,7 +252,7 @@ class Jobs:
             return True, "it was already running"
 
         self._say(job, "launching %s" % os.path.basename(command), phase="starting")
-        _tmux("kill-session", "-t", session)
+        _tmux("kill-session", "-t", _exact(session))
         # keep the launcher's own output; when a start fails the reason is
         # almost always in there, and the tmux session is gone by then
         log = os.path.join(vms.TERMOX_HOME, "%s.launch.log" % session)
@@ -289,7 +296,7 @@ class Jobs:
         """Returns (ok, message)."""
         pid = _find(spec["exe"], spec.get("match"))
         if not pid:
-            _tmux("kill-session", "-t", spec.get("session", ""))
+            _tmux("kill-session", "-t", _exact(spec.get("session", "")))
             return True, "it was not running"
 
         graceful = spec.get("graceful")
@@ -323,7 +330,7 @@ class Jobs:
                 pass
             time.sleep(1.5)
 
-        _tmux("kill-session", "-t", spec.get("session", ""))
+        _tmux("kill-session", "-t", _exact(spec.get("session", "")))
         if _alive(pid):
             return False, "the process would not exit"
         return True, "stopped"

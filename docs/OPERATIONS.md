@@ -37,6 +37,18 @@ tmux new-session -d -s scope 'cd ~/termox && python3 -m termox'
 
 `tmux attach -t scope` shows its log.
 
+**Termux:Boot runs every executable file in `~/.termux/boot/`**, not just
+`start-vm.sh`. Keep backups somewhere else: a `start-vm.sh.pre-adguard` left
+there brought the old 4 GB VM back on every boot, and it now lives in
+`~/.termux/boot-disabled/`.
+
+**Name tmux targets exactly.** `tmux kill-session -t llm` kills `llmgpu` when
+no session is called exactly `llm` -- a target with no exact match falls back
+to a prefix match -- and a server's session is gone the moment its server
+exits. The panel and `llm-use` therefore say `-t =llm`. Before that fix,
+switching models, or starting the CPU server from the panel while it was
+down, took the GPU server with it.
+
 ## Machines find themselves
 
 Nothing needs to be registered. termox walks `/proc` for `qemu-system-*`
@@ -113,6 +125,19 @@ the sidebar under **Services** with its own page: throughput trend, requests
 in flight, model and context, endpoints, and the process's CPU, memory, cores
 and priority.
 
+**One model at a time, switched from Termux.** `llm-use` lists the models and
+what port 8081 is serving; `llm-use 4b` or `llm-use 0.8b` stops the running
+server before starting the next, so two models never share the CPU or the
+RAM. The choice lives in `~/.llm-model`, which `llm.sh` reads, so a restart
+from the panel or a reboot brings back the model picked last. The models, and
+what each measures, are listed in `llm.sh`; adding one is a line there. Install
+the command once with `ln -s ~/llm-use.sh $PREFIX/bin/llm-use`.
+
+| model | prompt | generation (tok/s, llama.cpp 0.4.1, cool phone) |
+|---|---|---|
+| `0.8b` Qwen3.5-0.8B Q4_0 | 53 | 27 |
+| `4b` Qwen3.5-4B Q4_0 | 8.0 | 5.0 |
+
 **It runs on the CPU, not the GPU.** That is the opposite of what seems
 obvious, so here are the measurements (llama-bench, Qwen2.5-0.5B Q4_0, tg32):
 
@@ -131,17 +156,100 @@ earlier round of this work measured "0.13 tok/s on CPU" and concluded the CPU
 was hopeless -- that number was llama-bench defaulting to 8 threads, not a
 property of the phone.
 
+**Generation wants four threads, prompts want seven.** On llama.cpp 0.4.1,
+with the model server on cores 1-7 (see `tune.sh` below), single-token steps
+are still fastest on exactly the four big cores, but batches gain from the
+little cores too. llama-server takes the two separately, so `llm.sh` runs
+`-t 4 -tb 7`. Measured hot (see the heat cap below), prompt / generation:
+
+| threads | Qwen3.5-4B | Qwen3.5-0.8B |
+|---|---|---|
+| **4** | 5.64 / **4.23** | 37.2 / **19.7** |
+| 5 | 5.86 / 3.99 | |
+| 6 | 6.14 / 4.08 | 33.3 / 13.9 |
+| **7** (cores 1-7) | **6.49** / 4.06 | **39.7** / 12.9 |
+| 8 (cores 0-7) | | 7.8 / **0.19** |
+
+Eight threads still collapse: the eighth shares core 0 with the other
+services and the interrupts, and every step waits for it. The smaller the
+model, the more a slow little core costs a single step: seven
+threads take a third off the 0.8B's generation. Pinning to the big cores (with
+or without `--cpu-strict`), `--poll 100` and `--prio 2` all measured within 1%
+of leaving placement to the kernel. The process already runs at nice -10,
+inherited from the Termux app, and `SCHED_FIFO` is refused.
+
+**The heat cap.** Samsung's overheat protection caps both big clusters at
+1747 MHz (of 2419 and 2841) once the skin sensor nears 40 C — `sys.siop.level`
+climbing from 0 to 3, Android thermal status 2 and 3 — and lifts it about a
+minute after the phone cools back under. From 37 C, a minute of full load is
+enough to trip it. A long run of prompts gets there by itself, and so does
+screen mirroring (scrcpy's software encoder). The cap costs the 4B about 30%
+of its prompt speed and 16% of its generation. Neither turning the screen on
+nor `cmd power set-fixed-performance-mode-enabled true` moves it, and without
+root it cannot be lifted: it goes through `/sys/power/cpufreq_max_limit`,
+which even `adb shell` cannot read. Watch it with
+`adb shell getprop sys.siop.level` and
+`/sys/devices/system/cpu/cpufreq/policy{4,7}/scaling_max_freq`. What helps is
+cooling: the phone out of its case, on a fan.
+
 The GPU does work (see `~/clshim` and the notes below) but is 3.6x slower
 *and* numerically wrong for some models: on the Adreno OpenCL backend Qwen3.5
 emits degenerate loops at temperature 0, while the identical file on the CPU
 answers correctly. Qwen2.5 is fine on both, which is what made the fault look
 like broken model support at first.
 
+**Every GPU route was retested on llama.cpp 0.4.1, and the CPU still wins
+generation.** Qwen3.5-4B, prompt / generation in tok/s, hot phone except the
+rows marked *, measured cool, when the CPU alone did 8.0 / 5.0:
+
+| route | 4B |
+|---|---|
+| **CPU only**, 4 threads | 5.6 / **4.2** |
+| OpenCL, all layers * | 9.6 / 2.0, and still wrong for Qwen3.5 |
+| OpenCL, weights on the CPU (op offload) | 5.6 / 4.2 — nothing offloaded |
+| OpenCL, 16 of 32 layers | 6.7 / 2.6 |
+| Vulkan, Qualcomm's driver | segfaults as it starts, even at `-ngl 0` |
+| Vulkan, Mesa Turnip, all layers * | 10.3 / 0.5; llama-server dies with `vk::DeviceLostError` |
+| Turnip, weights on the CPU (op offload) | **8.4** / 3.2 |
+| Turnip, 16 of 32 layers | 10.4 / 0.9 |
+
+Turnip's op offload is the only route that beats the CPU at anything, and
+only at reading prompts, while it costs a quarter of the generation speed —
+the larger share of the time for a thinking model. Qualcomm's Vulkan driver is
+reachable only through a directory with `libvulkan.so` and `libvulkan.so.1`
+symlinked to `/system/lib64/libvulkan.so` first on `LD_LIBRARY_PATH`
+(Termux's own loader sees nothing but `llvmpipe`); Turnip, from
+`mesa-vulkan-icd-freedreno`, was tried unpacked in a private directory with
+`VK_ICD_FILENAMES` pointing at it, so that it could never reach the servers.
+
+Speculative decoding does not pay either: with the 0.8B drafting, the 4B's
+generation fell from 4.2 to 1.5 tok/s (a story, 30% of drafts accepted) and
+2.4 (code, 76% accepted); `--spec-type ngram-simple` changed nothing. The
+unsloth GGUFs carry no MTP layers, so `draft-mtp` is not available.
+
+**The two servers slow each other down.** While the GPU server generated, the
+4B on the CPU server dropped from 5.5 / 4.2 to 4.7 / 2.5 tok/s, even with the
+GPU server's host threads off the big cores: they share memory bandwidth and
+heat. That host side is itself CPU work, 16.7 tok/s with the big cores
+available against 11.1 on the little ones, which is the price of keeping it
+off them.
+
 **Context is allocated per slot, not per server.** llama-server defaults to
 several parallel slots and gives each one the full `-c`, so `-c 32768` alone
 would try to allocate four of them. Pair it with `--parallel 1` for a
 single-user setup: 32k context then costs about 0.2 GB rather than four times
 that. Verified with a 7,015-token prompt, processed at 32.9 tok/s.
+
+**Both models now get 64k, with the KV cache in q8_0** (`-fa on -ctk q8_0
+-ctv q8_0`; a quantised V cache needs flash attention). On this CPU the pair
+measured no slower than an f16 cache without it, and a little faster, at half
+the memory: 0.40 GB of cache for the 0.8B and 1.07 GB for the 4B. The 4B
+server then holds 3.7 GB; beside the GPU server, the phone's free memory
+bottomed out at 1.4 GB while it answered. A q4_0 cache would give back half a
+gigabyte at the same speed, if Immich ever needs it. `-n` is still not a
+ceiling on 0.4.1 (with `-n 777` a request for 2000 tokens got 1515), so the
+64k context is also the longest a looping answer can run: about an hour on the
+0.8B, four on the 4B.
 
 `--reasoning off` matters for short tasks: Qwen3.5 is a thinking model and will
 otherwise spend 300+ tokens deliberating before answering "name three
@@ -168,16 +276,34 @@ One trap in the telemetry: llama.cpp **resets its per-second gauges when
 value and reads zero forever after. The rates shown are derived from the
 monotonic counters instead.
 
-`~/tune.sh` splits the CPU: QEMU is confined to the slowest permitted cores
-and niced to 10, the model server runs unrestricted. It never pins to fixed
-core numbers, because **Android reshuffles which cores this app may use** —
-the permitted set was seen changing between two consecutive calls. Re-run it
-whenever the split looks wrong.
+`~/tune.sh` splits the CPU: **core 0 runs everything else** — Immich and its
+Postgres and Valkey, AutoClaim, AdGuard, the panel, QEMU (niced to 10) —
+**the CPU model server gets cores 1-7**, and the GPU server's host threads get
+the little cores 1-3 (it recognises that server by its `-ngl`). The
+launchers start each server on those cores with `taskset`, and `tune.sh`
+holds them there. It sets every thread, since masks belong
+to threads, and children inherit their parent's mask. The panel restarts
+services whenever it likes, so the boot script runs it as
+`tune.sh --watch` in a tmux session named `tune`, re-applying the split every
+30 seconds; `~/tune.sh` on its own makes one pass and prints every match.
+Change `RESERVED` at its top to give the other services more room.
 
-Not every model works. llama.cpp b10516's `qwen35` support is broken: Ollama's
-GGUF will not load (`rope.dimension_sections` expected 4, got 3) and unsloth's
-emits degenerate loops at temperature 0. That is not a GPU fault — Qwen2.5-0.5B
-on the same GPU answers correctly. Retest after `pkg upgrade llama-cpp`.
+It builds the model mask from the core count and never from
+`sched_getaffinity()`, and that is the lesson of the "permitted set that
+changes between two calls". Nothing reshuffles cores: **Qualcomm's core_ctl
+parks idle big cores** (core 4 and the prime core 7 here) and this kernel
+leaves parked cores out of what `sched_getaffinity()` reports, although
+`Cpus_allowed` in `/proc` still lists them. They wake as soon as there is
+load. The previous `tune.sh` copied that report onto llama-server, which kept
+the server off cores 4 and 7 for good: 3.55 / 2.62 tok/s (4B, prompt /
+generation) against 5.62 / 4.24 with all four big cores.
+
+Not every model works. llama.cpp b10516's `qwen35` support was broken: Ollama's
+GGUF would not load (`rope.dimension_sections` expected 4, got 3) and unsloth's
+emits degenerate loops at temperature 0 on the GPU. Retested on 0.4.1
+(2026-09-17): unsloth's Qwen3.5-0.8B and 4B are correct on the CPU and still
+wrong on OpenCL (the 0.8B loops, the 4B leaks a `</think>` into its answer).
+Qwen2.5-0.5B stays correct on both.
 
 ## Immich
 

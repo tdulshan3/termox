@@ -8,4 +8,4 @@ tmux new-session -d -s llm ~/llm.sh
 tmux new-session -d -s llmgpu ~/llm-gpu.sh
 tmux new-session -d -s autoclaim ~/autoclaim.sh
 tmux new-session -d -s immich ~/immich.sh
-(sleep 30; ~/tune.sh) >/dev/null 2>&1 &
+tmux new-session -d -s tune "~/tune.sh --watch"
