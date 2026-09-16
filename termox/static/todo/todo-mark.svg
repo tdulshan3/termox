@@ -1,0 +1,16 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" role="img" aria-label="Todo">
+  <!-- A calendar page with a tick, on the app's blue. Flat fills only, and
+       every shape is big enough that at 16px it still reads as a white
+       page with a mark on it. -->
+  <rect width="512" height="512" rx="116" fill="#0a84ff"/>
+  <!-- the page -->
+  <rect x="104" y="150" width="304" height="262" rx="46" fill="#ffffff"/>
+  <!-- two binder rings crossing the top edge -->
+  <rect x="166" y="102" width="44" height="96" rx="22" fill="#0a84ff"/>
+  <rect x="302" y="102" width="44" height="96" rx="22" fill="#0a84ff"/>
+  <rect x="176" y="112" width="24" height="76" rx="12" fill="#ffffff"/>
+  <rect x="312" y="112" width="24" height="76" rx="12" fill="#ffffff"/>
+  <!-- the tick -->
+  <path d="M182 292 L238 346 L334 236" fill="none" stroke="#0a84ff" stroke-width="42"
+        stroke-linecap="round" stroke-linejoin="round"/>
+</svg>

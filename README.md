@@ -17,7 +17,8 @@ browser  →  phone:8080   termox        (Termux, native, stdlib only)
                 ├─ :8082 /metrics      model server on the GPU
                 ├─ :3000 /control      AdGuard Home
                 ├─ :2283 /api/server   Immich, with PostgreSQL and Valkey behind it
-                └─ ssh 127.0.0.1:2222  inside each guest (when one exists)
+                ├─ ssh 127.0.0.1:2222  inside each guest (when one exists)
+                └─ /todo/              a todo list, one JSON file beside the registry
 ```
 
 Stdlib only on both ends. No pip, no npm, no build step, and **nothing
@@ -339,7 +340,9 @@ termox/            the dashboard package (stdlib only)
   services.py      model servers and DNS: process facts, metrics, probes
   control.py       start / stop / restart as jobs with running commentary
   server.py        HTTP server and the sampler threads
+  todo.py          the Todo app's store: one document, merged on conflict
   static/          the UI: hand-built SVG charts, no dependencies
+  static/todo/     the Todo app, vendored from the Todo project
 phone/             what runs on the phone outside the dashboard
   adguard.sh       AdGuard Home, with the Android workarounds it needs
   llm.sh           CPU model server, with the measurements that justify it
@@ -375,6 +378,30 @@ The dashboard binds `0.0.0.0:8080` with **no authentication** — keep it on the
 LAN or behind Tailscale. Set `TERMOX_TOKEN` to require a token. The model
 servers are equally open.
 
+## Todo
+
+The panel also hosts a todo list, at `http://<phone-ip>:8080/todo/`. Ideas
+sit on the left, one calendar in the middle zooms from a year to a day, and
+the selected todo is edited on the right. Drag an idea onto a date to
+schedule it, drag a todo to move it, and add a time only when one matters.
+Every date gets an automatic tone shared by everything on it; nobody picks
+colours.
+
+It is the same stack as the panel: stdlib Python and a page with no build
+step. The list is one JSON document at `~/.config/termox/todo.json`, read
+into memory once and rewritten atomically on every save, so it is shared by
+every device on the network and backs up with a single copy. Each browser
+keeps a copy too, so the page opens instantly and keeps working when the
+phone is out of reach. When two devices edit at once the server merges by
+item, newest write wins, and tombstones make sure a deletion on one device
+is not undone by a stale copy on another. It is deliberately not in Immich's
+PostgreSQL: that database comes and goes with Immich's launcher, and the
+phone has no Python driver for it.
+
+The rail shows what is due without opening the app, and the overview has a
+row of tiles for it. The app is developed in its own project and vendored
+here as `termox/todo.py` and `termox/static/todo/`.
+
 ## The look
 
 The panel is built on **Modernist**, a design system from a Claude Design
@@ -392,6 +419,10 @@ carries a choice in a link. Anything filled with the accent -- the attention
 band, primary buttons, the selected window -- carries white type in either
 theme, so an orange surface reads the same whichever ground is under it.
 
+The Todo app keeps its own look, the one its build spec asks for: flat black,
+Apple blue as the single action colour, rounded glass panels. It is a
+different kind of surface from a control panel, and it reads as one.
+
 The mark is an SVG so it stays sharp at the 24px it renders in the header and
 at favicon size, and it takes its ink from a CSS variable so the same file
 works on either ground. The one photograph on the panel is the device itself,
@@ -402,8 +433,14 @@ CC BY 4.0, vendored so the panel still draws with no route to the internet.
 
 ## Screenshots
 
-The sidebar groups everything into **Host**, **Machines** and **Services**, and
-each gets its own page. Any page can be linked to directly with `?view=<key>`.
+The sidebar groups everything into **Host**, **Machines**, **Services** and
+**Apps**, and each gets its own page. Any page can be linked to directly with
+`?view=<key>`.
+
+**Todo.** A week, with an idea inbox on the left and the selected day on the
+right. Overlapping timed todos share the column; untimed ones stack above it.
+
+![The Todo app](docs/img/todo.png)
 
 **Everything.** The default page: what wants attention, the readings across a
 window you pick, every machine and service with its controls, and where each

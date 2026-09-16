@@ -471,14 +471,35 @@ library are left alone, and Immich migrates the schema on its next start.
 because they are small and they hold the library. `pg_ctl -D ~/immich/pg stop`
 and `valkey-cli shutdown` if they should go too.
 
+## Todo
+
+The panel hosts a todo list at `http://<phone-ip>:8080/todo/`. It needs
+nothing installed: the page is static, and the list is one JSON document at
+`~/.config/termox/todo.json` (under `TERMOX_HOME`), written atomically on
+every save. Back it up by copying that file; restore it by copying it back
+and restarting the panel, which reads the file once at start.
+
+A file that cannot be parsed is moved aside as `todo.json.broken-<time>` and
+the app starts empty rather than refusing to load, so look for that name if
+the list ever comes up blank.
+
+When `TERMOX_TOKEN` is set the app needs it too. Open it from the panel's
+rail or overview and the token travels with the link; by hand, add
+`?token=...` to `/todo/`. Every browser keeps its own copy of the list, so a
+device that was editing while the phone was unreachable sends its changes
+when it next sees the panel, and the server merges them by item.
+
+The app is developed in its own project (`../Todo`) and vendored here by its
+`sync.sh`; edit it there, not under `termox/static/todo/`.
+
 ## Environment
 
 | Variable | Default | Meaning |
 |---|---|---|
 | `TERMOX_PORT` | 8080 | listen port |
 | `TERMOX_BIND` | 0.0.0.0 | listen address |
-| `TERMOX_TOKEN` | unset | require this token on `/api/*` |
-| `TERMOX_HOME` | `~/.config/termox` | registry, keys, known_hosts |
+| `TERMOX_TOKEN` | unset | require this token on `/api/*` and `/todo/` |
+| `TERMOX_HOME` | `~/.config/termox` | registry, keys, known_hosts, todo.json |
 | `TERMOX_DOCKER_REFRESH` | 240 | seconds between container refreshes |
 | `TERMOX_SSH_TIMEOUT` | 45 | seconds a guest probe may take |
 | `TERMOX_LLM_URL` | `http://127.0.0.1:8081` | model server to scrape |
@@ -506,8 +527,14 @@ LAN or behind Tailscale. Set `TERMOX_TOKEN` to require a token, then open
 ## API
 
 `GET /api/state` returns everything the UI draws: `host`, `nodes`, `guests`,
-`history`. `GET /api/host` and `GET /api/nodes` are the same data in smaller
-pieces.
+`history`, and a `todo` summary. `GET /api/host` and `GET /api/nodes` are the
+same data in smaller pieces.
+
+`GET /api/todo` returns the whole todo document; `PUT /api/todo` stores a
+client's copy, merging it with the current one when its `baseRevision` is
+stale, and returns what every client should now hold. `GET /api/todo/summary`
+is the count of what is open, due today and overdue, which is what the rail
+shows.
 
 ---
 
