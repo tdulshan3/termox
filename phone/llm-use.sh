@@ -48,9 +48,12 @@ if [ -n "$pid" ]; then
   printf 'stopping %s' "$(serving || echo 'the current model')"
   kill "$pid"
   i=0
-  while kill -0 "$pid" 2>/dev/null && [ $i -lt 30 ]; do
+  while kill -0 "$pid" 2>/dev/null && [ $i -lt 15 ]; do
     printf .; sleep 1; i=$((i + 1))
   done
+  # it normally goes in under a second; one still holding port 8081 and its
+  # gigabytes would make the next server fail to start
+  kill -0 "$pid" 2>/dev/null && { printf ' forcing'; kill -KILL "$pid"; sleep 1; }
   echo
 fi
 # "=llm", never "llm": a tmux target with no exact match falls back to a

@@ -80,6 +80,16 @@ a:hover { color: var(--color-accent-700); }
    and so flip with the theme. */
 .btn-primary { color: var(--tx-on-accent) !important; }
 .seg-opt:has(input:checked) { color: var(--tx-on-accent); }
+
+/* Segments that are buttons (the model switch): the pressed one is the
+   checked one, and a disabled one is not an option right now. */
+button.seg-opt { border: 0; background: none; font: inherit; color: inherit; }
+button.seg-opt + button.seg-opt { border-left: 1px solid var(--color-divider); }
+button.seg-opt[aria-pressed="true"],
+button.seg-opt[aria-pressed="true"]:hover { background: var(--color-accent); color: var(--tx-on-accent); cursor: default; }
+button.seg-opt:disabled:not([aria-pressed="true"]) { opacity: .45; cursor: default; }
+button.seg-opt:disabled:hover:not([aria-pressed="true"]) { background: none; }
+button.seg-opt:focus-visible { outline: 2px solid var(--color-accent); outline-offset: -2px; }
 .btn-primary:hover { background: var(--color-accent-600); }
 a { color: var(--color-accent-700); }
 [data-tx-theme="dark"] a { color: var(--color-accent-600); }

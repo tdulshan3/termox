@@ -125,13 +125,18 @@ the sidebar under **Services** with its own page: throughput trend, requests
 in flight, model and context, endpoints, and the process's CPU, memory, cores
 and priority.
 
-**One model at a time, switched from Termux.** `llm-use` lists the models and
-what port 8081 is serving; `llm-use 4b` or `llm-use 0.8b` stops the running
-server before starting the next, so two models never share the CPU or the
-RAM. The choice lives in `~/.llm-model`, which `llm.sh` reads, so a restart
-from the panel or a reboot brings back the model picked last. The models, and
-what each measures, are listed in `llm.sh`; adding one is a line there. Install
-the command once with `ln -s ~/llm-use.sh $PREFIX/bin/llm-use`.
+**One model at a time, switched from Termux or the panel.** `llm-use` lists
+the models and what port 8081 is serving; `llm-use 4b` or `llm-use 0.8b` stops
+the running server before starting the next, so two models never share the
+CPU or the RAM. The CPU server's page in the panel has the same switch under
+**Model**: it runs as a job like Restart, and reports done only once the new
+model answers `/health` (llama-server opens its port seconds before its
+weights are in). The choice lives in `~/.llm-model`, which `llm.sh` reads, so
+a restart from the panel or a reboot brings back the model picked last. The
+models, and what each measures, are listed in `llm.sh`; adding one is a line
+there, and both switches pick it up. Install the command once with
+`ln -s ~/llm-use.sh $PREFIX/bin/llm-use`. Restarting the panel mid-switch
+abandons the job with the old server stopped; start the server again.
 
 | model | prompt | generation (tok/s, llama.cpp 0.4.1, cool phone) |
 |---|---|---|
@@ -535,6 +540,13 @@ client's copy, merging it with the current one when its `baseRevision` is
 stale, and returns what every client should now hold. `GET /api/todo/summary`
 is the count of what is open, due today and overdue, which is what the rail
 shows.
+
+`POST /api/control` with `{"target": "svc:<id>", "action": "start" | "stop" |
+"restart"}` queues a job; `GET /api/jobs` follows it. For the CPU model server
+there is also `{"target": "svc:llm-cpu", "action": "switch", "model": "4b"}`,
+refused with a 400 unless `llm.sh` lists the model and its file is in
+`~/models`. The server's entry in `/api/state` carries the choices as
+`models`.
 
 ---
 
