@@ -286,17 +286,17 @@ function stateTag(label, kind) {
 
 const pendingTargets = new Set();
 
-async function act(target, action, label) {
+async function act(target, action, label, extra) {
   if (pendingTargets.has(target)) return;
   pendingTargets.add(target);
-  toast('work', label, action + 'ing');
+  toast('work', label, action === 'switch' ? 'switching to ' + extra.model : action + 'ing');
   render();
   try {
     const response = await fetch('/api/control', {
       method: 'POST',
       headers: Object.assign({ 'Content-Type': 'application/json' },
                              TOKEN ? { 'X-Termox-Token': TOKEN } : {}),
-      body: JSON.stringify({ target: target, action: action }),
+      body: JSON.stringify(Object.assign({ target: target, action: action }, extra || {})),
     });
     const data = await response.json();
     if (!response.ok) throw new Error(data.error || 'refused');
@@ -345,7 +345,8 @@ function activity(job, itemState) {
   if (!job && !transitional(itemState)) return null;
   const phase = job && job.phase;
   const verb = job
-    ? (phase === 'stopping' ? 'Stopping'
+    ? (job.action === 'switch' ? 'Switching to ' + (job.model || 'another model')
+       : phase === 'stopping' ? 'Stopping'
        : job.action === 'restart' ? 'Restarting' : 'Starting')
     : (itemState === 'stopping' ? 'Stopping' : 'Starting');
   const detail = job ? job.message : 'up but not answering on its port yet';
@@ -1455,6 +1456,54 @@ function tryItPanel(service) {
   ]);
 }
 
+/* The CPU server runs one model at a time, chosen from the ones llm.sh lists.
+   Picking one here is `llm-use <key>`: the server restarts on it and the
+   choice outlives a reboot. Buttons rather than radios, so that an arrow key
+   can never restart a server. */
+function modelPanel(service) {
+  const models = service.models;
+  if (!models || !(models.choices || []).length) return null;
+  const target = 'svc:' + service.id;
+  const busy = !!service.job || pendingTargets.has(target) || transitional(service.state);
+  const running = service.state === 'running';
+  const loaded = (service.model || '').split('/').pop();
+  const picked = models.choices.find((m) => m.key === models.selected);
+  const stale = picked && running && loaded && loaded !== picked.file;
+  return h('section', { style: 'padding:24px;border-bottom:' + DIV }, [
+    h('div', {
+      style: 'display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap',
+    }, [
+      h('div', { style: 'min-width:0' }, [
+        h('h3', { style: 'margin:0 0 4px', text: 'Model' }),
+        h('div', { class: 'text-muted', style: 'font-size:13px',
+                   text: 'One at a time. Switching restarts this server, which takes a few '
+                       + 'seconds and cuts off a request in flight. llm-use does the same '
+                       + 'from Termux.' }),
+      ]),
+      h('div', { class: 'seg', role: 'group', 'aria-label': 'Model' },
+        models.choices.map((m) => {
+          const current = m.key === models.selected;
+          return h('button', {
+            type: 'button', class: 'seg-opt',
+            'aria-pressed': current ? 'true' : 'false',
+            disabled: busy || current || !m.present,
+            title: m.present ? m.file + ' · ' + bytes(m.size) : m.file + ' is not in ~/models',
+            onclick: () => act(target, 'switch', service.name, { model: m.key }),
+          }, [m.key]);
+        })),
+    ]),
+    h('div', { style: 'margin-top:12px' }, [dl(models.choices.map((m) => [
+      m.key + (running && m.file === loaded ? ' · loaded' : ''),
+      m.file + ' · ' + (m.present ? bytes(m.size) : 'not in ~/models'),
+    ]))]),
+    stale
+      ? h('div', { class: 'text-muted', style: 'font-size:13px;margin-top:12px',
+                   text: picked.key + ' is selected, but ' + loaded + ' is still loaded. '
+                       + 'Restart the server to switch.' })
+      : null,
+  ]);
+}
+
 function renderService(data, service) {
   const runtime = service.runtime || {};
   const metrics = service.metrics || {};
@@ -1533,6 +1582,11 @@ function renderService(data, service) {
     tile('Uptime', duration(runtime.uptime), '',
          metrics.processing ? num(metrics.processing) + ' in flight' : 'idle'),
   ].filter(Boolean)));
+
+  if (service.id === 'llm-cpu') {
+    const models = modelPanel(service);
+    if (models) out.push(models);
+  }
 
   if (isModel) {
     const rate = serviceReading(service.id, 'rate');

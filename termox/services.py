@@ -15,7 +15,7 @@ import time
 import urllib.error
 import urllib.request
 
-from . import vms
+from . import control, vms
 
 CPU_PORT = int(os.environ.get("TERMOX_LLM_CPU_PORT", "8081"))
 GPU_PORT = int(os.environ.get("TERMOX_LLM_GPU_PORT", "8082"))
@@ -221,6 +221,10 @@ class Services:
             entry["state"] = "running"
             entry["runtime"] = self._process(spec["id"], pid, interval)
             entry["model"] = _model_name(argv)
+
+        if spec["id"] == "llm-cpu":
+            # what the page's model switch offers, stopped or not
+            entry["models"] = control.llm_models()
 
         if spec["id"] == "autoclaim":
             return _render_autoclaim(entry, spec)

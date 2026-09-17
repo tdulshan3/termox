@@ -11,6 +11,7 @@ right trade for a panel that is only ever a browser tab.
 """
 
 import os
+import re
 import signal
 import subprocess
 import threading
@@ -29,11 +30,13 @@ SERVICES = {
     "llm-cpu": {
         "session": "llm", "command": "~/llm.sh",
         "exe": "llama-server", "match": "8081", "probe": 8081,
+        "probe_kind": "health", "waiting": "loading the model",
         "ready": "the model is loaded and answering",
     },
     "llm-gpu": {
         "session": "llmgpu", "command": "~/llm-gpu.sh",
         "exe": "llama-server", "match": "8082", "probe": 8082,
+        "probe_kind": "health", "waiting": "loading the model",
         "ready": "the model is loaded and answering",
     },
     "dns": {
@@ -60,6 +63,16 @@ SERVICES = {
 }
 
 LAUNCHERS_PATH = os.path.join(vms.TERMOX_HOME, "launchers.json")
+
+# The CPU model server runs one model at a time. llm.sh lists the choices in a
+# case statement, one `  <key>) FILE=<gguf> ...` line each, and llm-use reads
+# the same lines, so a model added there shows up in both. The choice itself
+# lives in ~/.llm-model, which llm.sh reads every time it starts.
+LLM_SCRIPT = os.path.expanduser(SERVICES["llm-cpu"]["command"])
+LLM_CHOICE = os.path.expanduser("~/.llm-model")
+MODELS_DIR = os.path.expanduser("~/models")
+_CHOICE_LINE = re.compile(r"^  ([a-z0-9.]+)\) FILE=(\S+)")
+_DEFAULT_LINE = re.compile(r"^MODEL=\$\{MODEL:-([a-z0-9.]+)\}")
 
 
 # ------------------------------------------------------------------ helpers
@@ -114,6 +127,23 @@ def banner_open(port, host="127.0.0.1", timeout=3.0):
         sock.close()
 
 
+def health_ok(port, host="127.0.0.1", timeout=2.0):
+    """True only once a model is loaded.
+
+    A port probe is useless for llama-server too: it opens its port before
+    reading the weights and answers /health with 503 until they are in, so a
+    connect said "ready" while a 4B model still had seconds of loading to go.
+    """
+    import http.client
+    import urllib.request
+    try:
+        with urllib.request.urlopen("http://%s:%d/health" % (host, port),
+                                    timeout=timeout) as response:
+            return response.status == 200
+    except (OSError, ValueError, http.client.HTTPException):
+        return False                       # refused, 503, or not HTTP at all
+
+
 def _alive(pid):
     try:
         os.kill(pid, 0)
@@ -157,6 +187,65 @@ def node_launcher(node):
         if os.path.exists(candidate):
             return node["id"], candidate
     return node["id"], None
+
+
+def llm_models():
+    """The CPU server's models and which one is picked, or None without llm.sh.
+
+    {"choices": [{"key", "file", "present", "size"}...], "selected": key}
+    """
+    try:
+        with open(LLM_SCRIPT) as fh:
+            lines = fh.read().splitlines()
+    except OSError:
+        return None
+    choices, default = [], None
+    for line in lines:
+        found = _CHOICE_LINE.match(line)
+        if found:
+            try:
+                size = os.path.getsize(os.path.join(MODELS_DIR, found.group(2)))
+            except OSError:
+                size = None
+            choices.append({"key": found.group(1), "file": found.group(2),
+                            "present": size is not None, "size": size})
+            continue
+        found = _DEFAULT_LINE.match(line)
+        if found:
+            default = found.group(1)
+    if not choices:
+        return None
+    try:
+        with open(LLM_CHOICE) as fh:
+            selected = fh.read().strip() or default
+    except OSError:
+        selected = default
+    return {"choices": choices, "selected": selected}
+
+
+def model_problem(key):
+    """Why `key` cannot be switched to, or None when it can."""
+    models = llm_models()
+    if not models:
+        return "no model list: %s is missing or lists none" % LLM_SCRIPT
+    choice = next((c for c in models["choices"] if c["key"] == key), None)
+    if not choice:
+        return "no model called %r; llm.sh lists %s" % (
+            key, ", ".join(c["key"] for c in models["choices"]))
+    if not choice["present"]:
+        return "%s is not in %s" % (choice["file"], MODELS_DIR)
+    return None
+
+
+def select_model(key):
+    """Record the choice where llm.sh reads it, as `llm-use` does."""
+    problem = model_problem(key)
+    if problem:
+        raise ValueError(problem)
+    scratch = LLM_CHOICE + ".tmp"
+    with open(scratch, "w") as fh:
+        fh.write(key + "\n")
+    os.replace(scratch, LLM_CHOICE)
 
 
 # --------------------------------------------------------------------- jobs
@@ -220,6 +309,8 @@ class Jobs:
         if busy:
             return busy, "already %s" % busy["action"] + "ing"
         job = self._new(target, action, spec.get("label", target))
+        if spec.get("model"):
+            job["model"] = spec["model"]        # set before the worker starts
         worker = threading.Thread(
             target=self._work, args=(job, action, spec), daemon=True)
         worker.start()
@@ -237,11 +328,25 @@ class Jobs:
                 ok, message = self._stop(job, spec)
                 if ok:
                     ok, message = self._start(job, spec)
+            elif action == "switch":
+                ok, message = self._switch(job, spec)
             else:
                 ok, message = False, "unknown action"
             self._finish(job, "done" if ok else "failed", message)
         except Exception as exc:                # noqa: BLE001 - shown in the UI
             self._finish(job, "failed", str(exc))
+
+    def _switch(self, job, spec):
+        """A restart onto another model: the choice is written only once the
+        old server is down, so a failed stop leaves the selection as it was."""
+        model = spec["model"]
+        self._say(job, "switching to %s" % model)
+        ok, message = self._stop(job, spec)
+        if not ok:
+            return ok, message
+        select_model(model)
+        ok, message = self._start(job, spec)
+        return ok, ("now serving %s" % model) if ok else message
 
     def _start(self, job, spec):
         """Returns (ok, message)."""
@@ -282,7 +387,8 @@ class Jobs:
         if not probe:
             return True, "started"
 
-        wait_for = banner_open if spec.get("probe_kind") == "banner" else vms.probe
+        wait_for = {"banner": banner_open, "health": health_ok}.get(
+            spec.get("probe_kind"), vms.probe)
         self._say(job, spec.get("waiting", "loading; waiting for port %d" % probe))
         while time.time() < deadline:
             if wait_for(probe):

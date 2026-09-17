@@ -346,7 +346,7 @@ termox/            the dashboard package (stdlib only)
 phone/             what runs on the phone outside the dashboard
   adguard.sh       AdGuard Home, with the Android workarounds it needs
   llm.sh           CPU model server, with the measurements that justify it
-  llm-use.sh       `llm-use 4b`: switch the CPU server's model, one at a time
+  llm-use.sh       `llm-use 4b`: switch the CPU server's model (also in the panel)
   llm-gpu.sh       GPU model server on the Adreno
   tune.sh          core 0 for the services, cores 1-7 for the model servers
   vm.sh            the Alpine VM, kept for Docker work

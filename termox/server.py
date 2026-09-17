@@ -347,7 +347,7 @@ class State:
             if job:
                 item["job"] = {"action": job["action"], "message": job["message"],
                                "phase": job.get("phase"), "state": job["state"],
-                               "started": job["started"]}
+                               "started": job["started"], "model": job.get("model")}
                 item["state"] = job.get("phase") or (
                     "starting" if job["action"] == "start" else "stopping")
             else:
@@ -677,12 +677,21 @@ class Handler(BaseHTTPRequestHandler):
             return self._json({"error": "unreadable request"}, 400)
 
         target, action = body.get("target"), body.get("action")
-        if action not in ("start", "stop", "restart"):
+        if action not in ("start", "stop", "restart", "switch"):
             return self._json({"error": "unknown action"}, 400)
 
         spec = control_spec(target)
         if not spec:
             return self._json({"error": "nothing controllable called %r" % target}, 404)
+        if action == "switch":
+            # only the CPU server has models to choose between; llm.sh is
+            # what lists them, so it is also what a request is checked against
+            if target != "svc:llm-cpu":
+                return self._json({"error": "only the CPU model server switches models"}, 400)
+            problem = control.model_problem(body.get("model"))
+            if problem:
+                return self._json({"error": problem}, 400)
+            spec["model"] = body["model"]
 
         job, note = STATE.jobs.run(target, action, spec)
         return self._json({"job": job, "note": note})
