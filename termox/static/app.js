@@ -675,7 +675,9 @@ function rail(data) {
       sub: sub,
       actions: actions('svc:' + service.id, service.state, service.job, service.name, 'small')
         .concat(service.id === 'immich' && service.state === 'running'
-                ? [openImmich(service, null, 'Open', 'small')] : []),
+                ? [openImmich(service, null, 'Open', 'small')] : [])
+        .concat(service.id === 'finance' && service.state === 'running'
+                ? [openFinance(service, 'Open', 'small')] : []),
     }));
   });
 
@@ -694,7 +696,12 @@ function rail(data) {
 
   return h('nav', {
     'aria-label': 'Machines, services and apps', 'data-tx-rail': 'true',
-    style: 'border-right:' + DIV + ';position:sticky;top:59px;align-self:start',
+    // The rail is sticky under the 59px header. Without its own height it simply grows past the
+    // bottom of the window and the page scrollbar becomes the only way to reach the last service,
+    // which moves the content pane at the same time. Bounding it to the remaining viewport and
+    // letting it scroll independently keeps the two panes separate.
+    style: 'border-right:' + DIV + ';position:sticky;top:59px;align-self:start'
+         + ';max-height:calc(100vh - 59px);overflow-y:auto;overscroll-behavior:contain',
   }, kids);
 }
 
@@ -1010,7 +1017,6 @@ function serviceCard(service) {
           ['Ledger', service.finance_status === 'needs-setup' ? 'not set up'
                      : service.finance_locked ? 'locked' : 'unlocked'],
           ['Capture', financeCapture(service)],
-          ['Reachable', 'from the phone only'],
           ['Last scan', financeLastScan(service)],
           ['Resident', bytes(runtime.rss)],
           ['Uptime', duration(runtime.uptime)],
@@ -1101,28 +1107,29 @@ function openImmich(service, address, label, size) {
   });
 }
 
-// The finance ledger's own door. Same shape as Immich's, with one difference
-// that matters: the ledger binds loopback only, because its passphrase would
-// otherwise cross the LAN in the clear (its ADR 0007). So this link works from
-// the phone's own browser and nowhere else, and the button says so when the
-// panel is being read from another machine rather than looking broken.
-function openFinance(service, label) {
+// The finance ledger's own door. Same shape as Immich's: a destination rather
+// than something to glance at, and the phone serves both.
+//
+// Unlike Immich, the ledger asks for a passphrase, so the link lands on its
+// unlock screen rather than straight into anything readable.
+function openFinance(service, label, size) {
   const port = (service.endpoint || '').split(':').pop() || '8090';
-  const onPhone = location.hostname === '127.0.0.1' || location.hostname === 'localhost';
-  if (!onPhone) {
-    return h('span', {
-      class: 'text-muted',
-      style: 'font-size:12px;align-self:center',
-      text: 'Open on the phone · 127.0.0.1:' + port,
-    });
-  }
   return h('a', {
     class: 'btn',
     style: 'justify-content:flex-start;background:var(--tx-violet);color:#fff;'
-         + 'border-color:var(--tx-violet)',
-    href: 'http://127.0.0.1:' + port + '/',
+         + 'border-color:var(--tx-violet)'
+         + (size === 'small' ? ';font-size:11px;padding:3px 9px' : ''),
+    href: financeUrl(service, port),
     text: label || 'Open ledger',
   });
+}
+
+// Whatever host this panel was opened on, on the ledger's port. Viewed from the
+// phone that is 127.0.0.1; from a laptop it is the phone's LAN address, which is
+// why the server has to be bound beyond loopback for this to resolve.
+function financeUrl(service, port) {
+  const p = port || (service.endpoint || '').split(':').pop() || '8090';
+  return 'http://' + location.hostname + ':' + p + '/';
 }
 
 // "3 senders · 214 messages", or the reason there is nothing to say.
