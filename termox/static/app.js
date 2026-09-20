@@ -652,6 +652,17 @@ function rail(data) {
              service.db_open ? null : 'database down',
              service.queue_open ? null : 'queue down',
              bytes(runtime.rss)].filter(Boolean).join(' · ');
+    } else if (service.id === 'finance') {
+      // Locked is the state worth surfacing: the server answers normally, but the
+      // key is only in memory, so a restart leaves it unable to read anything and
+      // SMS capture paused until somebody types the passphrase.
+      const sms = service.finance_sms;
+      sub = [service.finance_status === 'needs-setup' ? 'not set up yet'
+               : service.finance_locked ? 'locked — capture paused'
+               : sms && sms.configured ? num(sms.staged) + ' messages'
+               : 'unlocked, no senders chosen',
+             !service.finance_locked && sms && sms.pending ? num(sms.pending) + ' to parse' : null,
+             bytes(runtime.rss)].filter(Boolean).join(' · ');
     } else {
       const rate = metrics.tokens_per_second || metrics.average_tps;
       sub = [rate ? num(rate, 1) + ' tok/s' : 'no requests yet',
@@ -994,6 +1005,16 @@ function serviceCard(service) {
           ['Day', (service.claim_day || '--')
                   + (service.claim_timezone ? ' · ' + service.claim_timezone : '')],
         ])
+      : service.id === 'finance'
+      ? dl([
+          ['Ledger', service.finance_status === 'needs-setup' ? 'not set up'
+                     : service.finance_locked ? 'locked' : 'unlocked'],
+          ['Capture', financeCapture(service)],
+          ['Reachable', 'from the phone only'],
+          ['Last scan', financeLastScan(service)],
+          ['Resident', bytes(runtime.rss)],
+          ['Uptime', duration(runtime.uptime)],
+        ])
       : service.id === 'immich'
       ? dl(service.library ? [
           ['Photos', num(service.library.photos) + ' · ' + bytes(service.library.usage_photos)],
@@ -1016,7 +1037,8 @@ function serviceCard(service) {
     h('div', { style: 'display:flex;gap:8px;margin-top:auto;flex-wrap:wrap' },
       actions('svc:' + service.id, service.state, service.job, service.name)
         .concat(service.id === 'autoclaim' && running ? [openAutoclaim('Open')] : [])
-        .concat(service.id === 'immich' && running ? [openImmich(service, null, 'Open Immich')] : [])),
+        .concat(service.id === 'immich' && running ? [openImmich(service, null, 'Open Immich')] : [])
+        .concat(service.id === 'finance' && running ? [openFinance(service, 'Open ledger')] : [])),
   ]);
 }
 
@@ -1077,6 +1099,51 @@ function openImmich(service, address, label, size) {
     href: photosUrl(service, address),
     text: label || 'Open Immich',
   });
+}
+
+// The finance ledger's own door. Same shape as Immich's, with one difference
+// that matters: the ledger binds loopback only, because its passphrase would
+// otherwise cross the LAN in the clear (its ADR 0007). So this link works from
+// the phone's own browser and nowhere else, and the button says so when the
+// panel is being read from another machine rather than looking broken.
+function openFinance(service, label) {
+  const port = (service.endpoint || '').split(':').pop() || '8090';
+  const onPhone = location.hostname === '127.0.0.1' || location.hostname === 'localhost';
+  if (!onPhone) {
+    return h('span', {
+      class: 'text-muted',
+      style: 'font-size:12px;align-self:center',
+      text: 'Open on the phone · 127.0.0.1:' + port,
+    });
+  }
+  return h('a', {
+    class: 'btn',
+    style: 'justify-content:flex-start;background:var(--tx-violet);color:#fff;'
+         + 'border-color:var(--tx-violet)',
+    href: 'http://127.0.0.1:' + port + '/',
+    text: label || 'Open ledger',
+  });
+}
+
+// "3 senders · 214 messages", or the reason there is nothing to say.
+function financeCapture(service) {
+  if (service.finance_locked) return 'paused — ledger is locked';
+  const sms = service.finance_sms;
+  if (!sms) return 'unknown';
+  if (!sms.configured) return 'no senders chosen yet';
+  return [num(sms.senders) + ' sender' + (sms.senders === 1 ? '' : 's'),
+          num(sms.staged) + ' messages',
+          sms.pending ? num(sms.pending) + ' to parse' : null].filter(Boolean).join(' · ');
+}
+
+// `ago` counts seconds, and the ledger reports an ISO timestamp, so convert
+// rather than handing it a string that would read as "never".
+function financeLastScan(service) {
+  const iso = (service.finance_sms || {}).last_scan;
+  if (!iso) return 'never';
+  const then = Date.parse(iso);
+  if (!isFinite(then)) return 'never';
+  return ago(Math.max(0, Math.round((Date.now() - then) / 1000)));
 }
 
 function queueName(name) {

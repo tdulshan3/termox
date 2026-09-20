@@ -25,6 +25,7 @@ AUTOCLAIM_PORT = int(os.environ.get("TERMOX_AUTOCLAIM_PORT", "8787"))
 IMMICH_PORT = int(os.environ.get("TERMOX_IMMICH_PORT", "2283"))
 IMMICH_DB_PORT = int(os.environ.get("TERMOX_IMMICH_DB_PORT", "5432"))
 IMMICH_QUEUE_PORT = int(os.environ.get("TERMOX_IMMICH_QUEUE_PORT", "6379"))
+FINANCE_PORT = int(os.environ.get("TERMOX_FINANCE_PORT", "8090"))
 
 
 def _read_secret(path):
@@ -107,6 +108,21 @@ SERVICES = [
         "match_port": False,
         "db_port": IMMICH_DB_PORT,
         "queue_port": IMMICH_QUEUE_PORT,
+    },
+    {
+        "id": "finance",
+        "name": "Finance · ledger",
+        # Next.js renames the process to `next-server (v16.3.5)` once it boots,
+        # which would be indistinguishable from any other Next app. Its start.js
+        # takes the title back afterwards, the same way Immich names itself, so
+        # argv[0] reads `pfa-finance`.
+        "exe": "pfa-finance",
+        "port": FINANCE_PORT,
+        "endpoint": "http://127.0.0.1:%d" % FINANCE_PORT,
+        "kind": "Next.js on Node, native",
+        "uses_gpu": False,
+        # The port comes from the environment, not the command line.
+        "match_port": False,
     },
 ]
 
@@ -240,6 +256,9 @@ class Services:
                     if child and entry["runtime"]:
                         _fold_child(entry["runtime"], child)
             return _render_immich(entry, spec)
+
+        if spec["id"] == "finance":
+            return _render_finance(entry, spec)
 
         if spec["id"] == "dns":
             # AdGuard has no /health; its liveness is whether the resolver
@@ -580,6 +599,54 @@ def _render_autoclaim(entry, spec):
         "outcomes": outcomes,
     }
     entry["claim_rewards"] = _rewards(wanted, scheduler.get("today"))
+    return entry
+
+
+def _render_finance(entry, spec):
+    """The finance ledger answers /api/health and deliberately nothing else.
+
+    It is not a model server, so llama.cpp's /health, /props and /v1/models
+    would 404 three times per poll and leave it reported as "starting" forever.
+
+    What matters at a glance is not uptime but whether it is **locked**. The key
+    is derived from a passphrase and held only in memory, so every restart --
+    including one from Android's phantom process killer -- leaves the server
+    answering but unable to read anything, and SMS capture paused until somebody
+    opens the app and types it. A locked ledger looks perfectly healthy from the
+    outside, which is exactly why it is worth surfacing here.
+
+    The endpoint returns no financial data at all: no amounts, no balances, no
+    merchant or sender names, no message content. Only service facts, because
+    this dashboard has no authentication of its own.
+    """
+    health = _fetch(spec["endpoint"] + "/api/health")
+    if health is None:
+        if entry["state"] == "running":
+            entry["state"] = "starting"      # process up, not yet serving
+        return entry
+    entry["state"] = "running"
+
+    try:
+        data = json.loads(health)
+    except ValueError:
+        return entry
+
+    entry["finance_status"] = data.get("status")        # needs-setup | locked | ready
+    entry["finance_locked"] = bool(data.get("locked"))
+    entry["finance_schema"] = data.get("schemaVersion")
+    entry["finance_unlocked_since"] = data.get("unlockedSince")
+
+    # Present only while unlocked; absent is not an error, it is the locked state.
+    sms = data.get("sms")
+    if isinstance(sms, dict) and "error" not in sms:
+        entry["finance_sms"] = {
+            "configured": bool(sms.get("configured")),
+            "senders": sms.get("enabledSenders"),
+            "staged": sms.get("stagedMessages"),
+            "pending": sms.get("pendingMessages"),
+            "last_scan": sms.get("lastScanAt"),
+            "capability": sms.get("capability"),
+        }
     return entry
 
 
