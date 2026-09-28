@@ -11,6 +11,7 @@
 
 const POLL_MS = 2000;
 const TOKEN = new URLSearchParams(location.search).get('token');
+const WEBCAM_BRIDGE = 'http://127.0.0.1:8765';
 
 const state = {
   data: null,
@@ -26,6 +27,9 @@ const state = {
   draft: '',
   sending: false,
   logs: {},
+  webcam: { reachable: false, loading: true },
+  webcamDraft: null,
+  webcamBusy: false,
 };
 
 /* ------------------------------------------------------------ formatting */
@@ -357,6 +361,138 @@ function activity(job, itemState) {
     h('span', { 'data-tx-dot': 'busy', style: 'flex:none' }),
     h('span', { style: 'font-family:var(--font-heading);font-weight:800;font-size:14px', text: verb }),
     h('span', { class: 'text-muted', style: 'font-size:13px', text: detail }),
+  ]);
+}
+
+/* ------------------------------------------------------- desktop webcam */
+
+function webcamValues() {
+  if (state.webcamDraft) return state.webcamDraft;
+  const settings = (state.webcam || {}).settings || {};
+  return {
+    lens: settings.lens || 'wide',
+    zoom: Number(settings.zoom || 1),
+    flip_horizontal: !!settings.flip_horizontal,
+    flip_vertical: !!settings.flip_vertical,
+    torch: !!settings.torch,
+  };
+}
+
+async function pollWebcam() {
+  try {
+    const response = await fetch(WEBCAM_BRIDGE + '/state', { cache: 'no-store' });
+    if (!response.ok) throw new Error('HTTP ' + response.status);
+    const fresh = await response.json();
+    state.webcam = Object.assign({ reachable: true, loading: false }, fresh);
+  } catch (err) {
+    state.webcam = {
+      reachable: false,
+      loading: false,
+      reason: 'Open this dashboard on the Linux PC running the webcam bridge.',
+    };
+  }
+  if (state.data) render();
+}
+
+async function setWebcam(action) {
+  if (state.webcamBusy) return;
+  state.webcamBusy = true;
+  render();
+  const applying = action === 'apply';
+  try {
+    const response = await fetch(WEBCAM_BRIDGE + '/' + action, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(applying ? webcamValues() : {}),
+    });
+    const fresh = await response.json();
+    if (!response.ok) throw new Error(fresh.error || 'desktop bridge refused the request');
+    state.webcam = Object.assign({ reachable: true, loading: false }, fresh);
+    state.webcamDraft = null;
+    toast('good', 'S20 webcam', applying ? 'settings applied' : 'camera released');
+  } catch (err) {
+    toast('bad', 'S20 webcam', err.message);
+  } finally {
+    state.webcamBusy = false;
+    pollWebcam();
+  }
+}
+
+function webcamField(label, control) {
+  return h('label', { class: 'tx-camera-field' }, [
+    h('span', { text: label }),
+    control,
+  ]);
+}
+
+function webcamToggle(label, key, values) {
+  return webcamField(label, h('input', {
+    type: 'checkbox', checked: values[key],
+    onchange: (e) => {
+      state.webcamDraft = Object.assign({}, values, { [key]: e.target.checked });
+      render();
+    },
+  }));
+}
+
+function webcamSection() {
+  const camera = state.webcam || {};
+  const values = webcamValues();
+  const running = !!camera.running;
+  const status = camera.loading ? 'checking'
+    : !camera.reachable ? 'desktop bridge offline'
+    : running ? (camera.lens || values.lens) + ' active'
+    : 'stopped';
+
+  return h('section', { class: 'tx-camera', style: 'padding:24px;border-bottom:' + DIV }, [
+    sectionHead('Desktop webcam',
+      'The panel stays on the S20; a loopback-only bridge applies these controls on this Linux PC.',
+      stateTag(status, camera.loading ? 'busy' : running ? 'up' : camera.reachable ? 'down' : 'down')),
+    camera.reachable
+      ? h('div', { class: 'tx-camera-grid' }, [
+          webcamField('Lens', h('select', {
+            class: 'input', value: values.lens,
+            onchange: (e) => {
+              state.webcamDraft = Object.assign({}, values, { lens: e.target.value });
+              render();
+            },
+          }, [
+            h('option', { value: 'wide', selected: values.lens === 'wide', text: 'Wide' }),
+            h('option', { value: 'ultrawide', selected: values.lens === 'ultrawide', text: 'Ultrawide' }),
+          ])),
+          webcamField('Zoom · ' + Number(values.zoom).toFixed(1) + '×', h('input', {
+            type: 'range', min: '1', max: '8', step: '0.1', value: values.zoom,
+            oninput: (e) => {
+              state.webcamDraft = Object.assign({}, values, { zoom: Number(e.target.value) });
+              const label = e.target.closest('label').querySelector('span');
+              if (label) label.textContent = 'Zoom · ' + Number(e.target.value).toFixed(1) + '×';
+            },
+            onchange: (e) => {
+              state.webcamDraft = Object.assign({}, values, { zoom: Number(e.target.value) });
+              render();
+            },
+          })),
+          webcamToggle('Horizontal flip', 'flip_horizontal', values),
+          webcamToggle('Vertical flip', 'flip_vertical', values),
+          webcamToggle('Flashlight', 'torch', values),
+          h('div', { class: 'tx-camera-actions' }, [
+            h('button', {
+              type: 'button', class: 'btn btn-primary', disabled: state.webcamBusy,
+              onclick: () => setWebcam('apply'),
+            }, [state.webcamBusy ? h('span', { class: 'tx-spin' }) : null,
+                state.webcamBusy ? 'Applying' : 'Apply and start']),
+            h('button', {
+              type: 'button', class: 'btn btn-secondary', disabled: state.webcamBusy || !running,
+              onclick: () => setWebcam('stop'),
+            }, ['Stop']),
+          ]),
+        ])
+      : h('div', { class: 'tx-camera-offline' }, [
+          h('div', { class: 'text-muted', text: camera.reason || 'The desktop bridge is not answering.' }),
+          h('button', {
+            type: 'button', class: 'btn btn-secondary', onclick: pollWebcam,
+          }, ['Retry desktop']),
+        ]),
   ]);
 }
 
@@ -874,6 +1010,7 @@ function renderOverview(data) {
     }, nodes.map(nodeCard).concat(services.map(serviceCard))),
   ]));
 
+  out.push(webcamSection());
   out.push(todoSection(data));
   out.push(wiringSection(data));
   out.push(pathsSection(data));
@@ -2288,4 +2425,6 @@ state.narrow = root.clientWidth < 900;
 new ResizeObserver(measure).observe(root);
 render();
 poll();
+pollWebcam();
 setInterval(poll, POLL_MS);
+setInterval(pollWebcam, 5000);

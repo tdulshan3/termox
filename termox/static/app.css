@@ -172,6 +172,77 @@ pre.tx-log {
 .tx-toast.bad i { background: var(--tx-red); }
 .tx-toast.work i { background: var(--color-accent); animation: tx-beat 1.4s ease-in-out infinite; }
 
+/* Browser-local controls for the Linux webcam bridge. The dashboard itself
+   remains on the phone; only this compact panel reaches 127.0.0.1. */
+.tx-camera-grid {
+  display: grid;
+  grid-template-columns: repeat(5, minmax(130px, 1fr)) auto;
+  gap: 2px;
+  background: var(--color-divider);
+  border: 2px solid var(--color-divider);
+}
+.tx-camera-field {
+  min-height: 82px;
+  padding: 13px 14px;
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  gap: 10px;
+  background: var(--color-bg);
+  font-family: var(--font-heading);
+  font-size: 12px;
+  font-weight: 800;
+}
+.tx-camera-field > input[type="checkbox"] {
+  appearance: none;
+  width: 44px;
+  height: 24px;
+  margin: 0;
+  border: 2px solid var(--color-divider);
+  background: var(--color-surface);
+  cursor: pointer;
+  position: relative;
+}
+.tx-camera-field > input[type="checkbox"]::after {
+  content: "";
+  position: absolute;
+  width: 14px;
+  height: 14px;
+  left: 3px;
+  top: 3px;
+  background: var(--color-text);
+  transition: transform 120ms ease;
+}
+.tx-camera-field > input[type="checkbox"]:checked {
+  background: var(--color-accent);
+  border-color: var(--color-accent);
+}
+.tx-camera-field > input[type="checkbox"]:checked::after {
+  background: var(--color-bg);
+  transform: translateX(20px);
+}
+.tx-camera-field > input[type="range"] {
+  width: 100%;
+  accent-color: var(--color-accent);
+}
+.tx-camera-actions {
+  min-height: 82px;
+  padding: 13px 14px;
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  flex-wrap: wrap;
+  background: var(--color-bg);
+}
+.tx-camera-offline {
+  padding: 16px;
+  border: 1px dashed var(--color-divider);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+}
+
 /* Narrow — the rail stops being a column and becomes the top of the page.
    Driven by a measured flag on the root rather than a media query, so the
    same rules hold in an embedded frame and on a real phone. */
@@ -186,6 +257,9 @@ pre.tx-log {
 [data-tx-narrow] main section { padding-left: 16px !important; padding-right: 16px !important; }
 [data-tx-narrow] [data-tx-poster] { padding: 16px !important; }
 [data-tx-narrow] [data-tx-poster] h1 { font-size: 27px !important; }
+[data-tx-narrow] .tx-camera-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+[data-tx-narrow] .tx-camera-actions { grid-column: 1 / -1; }
+[data-tx-narrow] .tx-camera-offline { align-items: stretch; flex-direction: column; }
 [data-tx-narrow] main h1 { font-size: 30px !important; }
 [data-tx-narrow] main h3 { font-size: 21px !important; }
 [data-tx-narrow] .btn { min-height: 44px; }

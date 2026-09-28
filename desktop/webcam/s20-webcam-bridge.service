@@ -1,0 +1,13 @@
+[Unit]
+Description=Loopback bridge for Termox S20 webcam controls
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /home/tdulshan/.local/lib/s20-webcam/webcam_bridge.py
+Environment=S20_WEBCAM_ALLOWED_ORIGINS=http://192.168.1.118:8080,http://127.0.0.1:8080,http://localhost:8080
+Restart=on-failure
+RestartSec=2
+
+[Install]
+WantedBy=default.target

@@ -19,10 +19,41 @@ browser  →  phone:8080   termox        (Termux, native, stdlib only)
                 ├─ :2283 /api/server   Immich, with PostgreSQL and Valkey behind it
                 ├─ ssh 127.0.0.1:2222  inside each guest (when one exists)
                 └─ /todo/              a todo list, one JSON file beside the registry
+
+browser  →  127.0.0.1:8765             (Linux desktop only)
+                └─ S20 webcam bridge   scrcpy lens, zoom, flips and torch
 ```
 
 Stdlib only on both ends. No pip, no npm, no build step, and **nothing
 installed inside the guests**.
+
+### Desktop webcam controls
+
+The **Desktop webcam** section controls the S20 camera when the dashboard is
+opened on the Linux PC. Termox still runs entirely on the phone. A small
+loopback-only companion on the PC writes the scrcpy settings and restarts the
+wide or ultrawide user service; it never listens on the LAN.
+
+Install the companion once on the PC:
+
+```sh
+desktop/webcam/install.sh
+```
+
+The panel can then select wide or ultrawide, zoom from 1x to 8x, flip either
+axis independently, toggle the flashlight, and stop the feed. The camera is
+published through the existing `/dev/video0` v4l2loopback device and appears
+to apps as **DroidCam**. Applying a change restarts capture for a few seconds
+because scrcpy accepts these camera options only at startup.
+
+The bridge accepts browser requests only from the configured Termox origins.
+If the phone address changes, edit `S20_WEBCAM_ALLOWED_ORIGINS` in
+`~/.config/systemd/user/s20-webcam-bridge.service`, then run:
+
+```sh
+systemctl --user daemon-reload
+systemctl --user restart s20-webcam-bridge.service
+```
 
 ---
 

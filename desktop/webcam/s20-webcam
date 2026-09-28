@@ -1,0 +1,165 @@
+#!/bin/sh
+
+ADB_BIN=/home/tdulshan/Android/Sdk/platform-tools/adb
+SCRCPY_BIN=/usr/bin/scrcpy
+V4L2_CTL=/usr/bin/v4l2-ctl
+WEBCAM_DEVICE=/dev/video0
+PHONE_MODEL=SM_G981U1
+PHONE_MDNS_PREFIX=adb-RFCN101SHYV-
+RUNTIME_DIR=${XDG_RUNTIME_DIR:-/tmp}
+PID_FILE="$RUNTIME_DIR/s20-webcam.pid"
+LOCK_FILE="$RUNTIME_DIR/s20-webcam.lock"
+LOG_DIR=/home/tdulshan/.local/state
+LOG_FILE="$LOG_DIR/s20-webcam.log"
+CONFIG_FILE=/home/tdulshan/.config/s20-webcam/settings.conf
+
+mkdir -p "$LOG_DIR"
+exec >> "$LOG_FILE" 2>&1
+printf '\n[%s] Starting S20 webcam: %s\n' "$(date --iso-8601=seconds)" "${1:-none}"
+
+exec 9> "$LOCK_FILE"
+flock 9
+
+case "${1:-}" in
+    wide)
+        camera_id=0
+        lens_name="Wide"
+        ;;
+    ultrawide)
+        camera_id=2
+        lens_name="Ultrawide"
+        ;;
+    *)
+        notify-send "S20 Webcam" "Unknown lens: ${1:-none}"
+        exit 2
+        ;;
+esac
+
+zoom=1.0
+flip_horizontal=false
+flip_vertical=false
+torch=false
+if [ -r "$CONFIG_FILE" ]; then
+    config_zoom=$(awk -F= '$1 == "zoom" { print $2; exit }' "$CONFIG_FILE")
+    if awk -v value="$config_zoom" 'BEGIN { exit !(value ~ /^[0-9]+([.][0-9]+)?$/ && value >= 1 && value <= 8) }'; then
+        zoom=$config_zoom
+    fi
+    config_flip_horizontal=$(awk -F= '$1 == "flip_horizontal" { print $2; exit }' "$CONFIG_FILE")
+    if [ -z "$config_flip_horizontal" ]; then
+        config_flip_horizontal=$(awk -F= '$1 == "flip" { print $2; exit }' "$CONFIG_FILE")
+    fi
+    [ "$config_flip_horizontal" = true ] && flip_horizontal=true
+    config_flip_vertical=$(awk -F= '$1 == "flip_vertical" { print $2; exit }' "$CONFIG_FILE")
+    [ "$config_flip_vertical" = true ] && flip_vertical=true
+    config_torch=$(awk -F= '$1 == "torch" { print $2; exit }' "$CONFIG_FILE")
+    [ "$config_torch" = true ] && torch=true
+fi
+orientation=0
+if [ "$flip_horizontal" = true ] && [ "$flip_vertical" = true ]; then
+    orientation=180
+elif [ "$flip_horizontal" = true ]; then
+    orientation=flip0
+elif [ "$flip_vertical" = true ]; then
+    orientation=flip180
+fi
+printf '[%s] Lens=%s zoom=%s horizontal=%s vertical=%s torch=%s\n' \
+    "$(date --iso-8601=seconds)" "$lens_name" "$zoom" \
+    "$flip_horizontal" "$flip_vertical" "$torch"
+
+if [ ! -e "$WEBCAM_DEVICE" ] || ! "$V4L2_CTL" -d "$WEBCAM_DEVICE" --all 2>/dev/null | grep -q "v4l2 loopback"; then
+    notify-send "S20 Webcam" "$WEBCAM_DEVICE is not available as a virtual webcam."
+    exit 1
+fi
+
+# DroidCam leaves its last 640x480 format pinned. Allow scrcpy to negotiate 1080p.
+"$V4L2_CTL" -d "$WEBCAM_DEVICE" --set-ctrl=keep_format=0 >/dev/null 2>&1 || true
+
+if [ -s "$PID_FILE" ]; then
+    old_pid=$(sed -n '1p' "$PID_FILE")
+    case "$old_pid" in
+        *[!0-9]*|'') ;;
+        *)
+            old_command=
+            if [ -r "/proc/$old_pid/cmdline" ]; then
+                old_command=$(tr '\000' ' ' < "/proc/$old_pid/cmdline" 2>/dev/null || true)
+            fi
+            if printf '%s\n' "$old_command" | grep -q 'scrcpy.*--video-source=camera' && kill -0 "$old_pid" 2>/dev/null; then
+                kill "$old_pid" 2>/dev/null || true
+                i=0
+                while kill -0 "$old_pid" 2>/dev/null && [ "$i" -lt 50 ]; do
+                    sleep 0.1
+                    i=$((i + 1))
+                done
+                if kill -0 "$old_pid" 2>/dev/null; then
+                    kill -KILL "$old_pid" 2>/dev/null || true
+                fi
+                sleep 1
+            fi
+            ;;
+    esac
+fi
+
+target="$($ADB_BIN devices -l 2>/dev/null | awk -v model="$PHONE_MODEL" '$2 == "device" && $1 ~ /:/ && index($0, "model:" model) { print $1; exit }')"
+
+if [ -z "$target" ]; then
+    target="$($ADB_BIN mdns services 2>/dev/null | awk -v prefix="$PHONE_MDNS_PREFIX" '$1 ~ "^" prefix && $2 == "_adb-tls-connect._tcp" { print $3; exit }')"
+fi
+
+if [ -z "$target" ]; then
+    notify-send "S20 Webcam" "Turn on Wireless debugging on the S20, then try again."
+    exit 1
+fi
+
+if ! timeout 8s "$ADB_BIN" connect "$target" >/dev/null 2>&1; then
+    notify-send "S20 Webcam" "Could not connect to $target."
+    exit 1
+fi
+
+# DroidCam may keep the Android camera open even when its desktop client is idle.
+"$ADB_BIN" -s "$target" shell am force-stop com.dev47apps.droidcam >/dev/null 2>&1 || true
+
+set -- "$SCRCPY_BIN" \
+    -s "$target" \
+    --video-source=camera \
+    --camera-id="$camera_id" \
+    --camera-size=1920x1080 \
+    --camera-fps=30 \
+    --camera-zoom="$zoom" \
+    --v4l2-sink="$WEBCAM_DEVICE" \
+    --no-playback \
+    --no-audio
+
+[ "$orientation" != 0 ] && set -- "$@" --capture-orientation="$orientation"
+[ "$torch" = true ] && set -- "$@" --camera-torch
+
+"$@" &
+
+scrcpy_pid=$!
+printf '%s\n' "$scrcpy_pid" > "$PID_FILE"
+
+# Camera startup over wireless ADB takes a few seconds. Announce success only
+# after scrcpy remains alive long enough to initialize the encoder and V4L2 sink.
+sleep 4
+if ! kill -0 "$scrcpy_pid" 2>/dev/null; then
+    wait "$scrcpy_pid"
+    status=$?
+    rm -f "$PID_FILE"
+    flock -u 9
+    notify-send "S20 Webcam" "$lens_name lens failed to start. See $LOG_FILE."
+    exit "$status"
+fi
+
+flock -u 9
+notify-send "S20 Webcam" "$lens_name lens is now available as DroidCam."
+wait "$scrcpy_pid"
+status=$?
+
+if [ "$(sed -n '1p' "$PID_FILE" 2>/dev/null)" = "$scrcpy_pid" ]; then
+    rm -f "$PID_FILE"
+fi
+
+if [ "$status" -ne 0 ] && [ "$status" -ne 143 ]; then
+    notify-send "S20 Webcam" "$lens_name lens stopped unexpectedly."
+fi
+
+exit "$status"

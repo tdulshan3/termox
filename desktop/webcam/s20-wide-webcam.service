@@ -1,0 +1,9 @@
+[Unit]
+Description=Galaxy S20 wide-lens wireless webcam
+Conflicts=s20-ultrawide-webcam.service
+
+[Service]
+Type=simple
+ExecStartPre=/usr/bin/sleep 1
+ExecStart=/home/tdulshan/.local/bin/s20-webcam wide
+KillMode=control-group
